@@ -23,7 +23,8 @@ import (
 const (
 	videoTrackID     = "screen"
 	videoStreamID    = "desktop"
-	videoFrameBuffer = 4
+	videoFrameBuffer = 8
+	maxQueuedLatency = 90 * time.Millisecond
 )
 
 type Manager struct {
@@ -70,7 +71,7 @@ func NewManager() (*Manager, error) {
 	if fps := os.Getenv("SCREEN_SERVER_CAPTURE_FPS"); fps != "" {
 		if parsed, err := strconv.Atoi(fps); err == nil && parsed > 0 {
 			captureCfg.FPS = parsed
-			captureCfg.GOP = parsed
+			captureCfg.GOP = max(1, parsed/4)
 		}
 	}
 
@@ -282,7 +283,7 @@ func (s *Session) Start(parent context.Context, cfg capture.FFmpegConfig) error 
 	}
 
 	frames := make(chan capture.EncodedFrame, videoFrameBuffer)
-	go s.readFrames(stream, frames)
+	go s.readFrames(cfg, stream, frames)
 	go s.writeFrames(frames)
 	go s.readRTCP()
 
@@ -302,7 +303,7 @@ func (s *Session) Close() {
 	})
 }
 
-func (s *Session) readFrames(stream *capture.FFmpegCapture, frames chan capture.EncodedFrame) {
+func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCapture, frames chan capture.EncodedFrame) {
 	defer close(frames)
 	defer func() {
 		if err := stream.Stop(); err != nil {
@@ -324,6 +325,26 @@ func (s *Session) readFrames(stream *capture.FFmpegCapture, frames chan capture.
 				log.Printf("read h264 frame failed client=%s err=%v", s.clientID, err)
 			}
 			return
+		}
+
+		if len(frames)*int(frame.Duration) > int(maxQueuedLatency) {
+			log.Printf("video queue exceeded latency budget client=%s queued=%d; restarting encoder for fresh IDR", s.clientID, len(frames))
+			if err := stream.Stop(); err != nil {
+				log.Printf("stop delayed capture failed client=%s err=%v", s.clientID, err)
+			}
+			for len(frames) > 0 {
+				<-frames
+			}
+			restarted, err := capture.StartFFmpegCapture(s.ctx, cfg)
+			if err != nil {
+				if s.ctx.Err() == nil {
+					log.Printf("restart capture failed client=%s err=%v", s.clientID, err)
+				}
+				return
+			}
+			stream = restarted
+			reader = stream.Reader()
+			continue
 		}
 
 		// H.264 P-frames reference earlier frames. Dropping arbitrary encoded

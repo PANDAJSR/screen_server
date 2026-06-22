@@ -40,7 +40,7 @@ func DefaultFFmpegConfig() FFmpegConfig {
 		Bitrate:     "8M",
 		MaxRate:     "12M",
 		BufferSize:  "1M",
-		GOP:         60,
+		GOP:         15,
 		UseHardware: true,
 	}
 }
