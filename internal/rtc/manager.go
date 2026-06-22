@@ -23,7 +23,7 @@ import (
 const (
 	videoTrackID     = "screen"
 	videoStreamID    = "desktop"
-	videoFrameBuffer = 1
+	videoFrameBuffer = 4
 )
 
 type Manager struct {
@@ -126,14 +126,22 @@ func (m *Manager) handleOffer(ctx context.Context, signal signaling.ServerSignal
 	}
 
 	m.mu.Lock()
-	old := m.sessions[signal.ClientID]
+	var oldSessions []*Session
+	for id, oldSession := range m.sessions {
+		oldSessions = append(oldSessions, oldSession)
+		delete(m.sessions, id)
+	}
 	m.sessions[signal.ClientID] = session
 	pending := append([]webrtc.ICECandidateInit(nil), m.pendingICE[signal.ClientID]...)
 	delete(m.pendingICE, signal.ClientID)
 	m.mu.Unlock()
 
-	if old != nil {
-		old.Close()
+	// The current FFmpeg/AVFoundation path is a single-capture pipeline. Running
+	// multiple screen captures at once makes macOS fall back or stall, so a new
+	// viewer takes over the single active session. A future shared capture fanout
+	// can support multiple viewers without duplicating the OS capture source.
+	for _, oldSession := range oldSessions {
+		oldSession.Close()
 	}
 
 	if err := session.pc.SetRemoteDescription(offer); err != nil {
@@ -318,20 +326,15 @@ func (s *Session) readFrames(stream *capture.FFmpegCapture, frames chan capture.
 			return
 		}
 
+		// H.264 P-frames reference earlier frames. Dropping arbitrary encoded
+		// frames corrupts the decoder until the next IDR, which shows up as
+		// tearing/smearing while dragging windows. Preserve bitstream continuity
+		// and let backpressure reach FFmpeg; the encoder is already constrained
+		// to the target FPS and Pion pacing keeps latency bounded.
 		select {
 		case frames <- frame:
-		default:
-			// Low-latency policy: never let WebRTC backpressure stall FFmpeg stdout.
-			// We keep only the freshest encoded frame and drop stale frames. This
-			// trades visual continuity for bounded latency under network pressure.
-			select {
-			case <-frames:
-			default:
-			}
-			select {
-			case frames <- frame:
-			default:
-			}
+		case <-s.ctx.Done():
+			return
 		}
 	}
 }
