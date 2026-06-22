@@ -1,0 +1,214 @@
+:root {
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  color: #1d2430;
+  background: #f5f7fa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.shell {
+  width: min(1120px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 32px 0;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 28px;
+  line-height: 1.15;
+}
+
+h2 {
+  font-size: 18px;
+  margin-bottom: 12px;
+}
+
+.toolbar p {
+  color: #596579;
+  margin-top: 4px;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 112px;
+  justify-content: center;
+  border: 1px solid #cfd7e3;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #ffffff;
+  font-weight: 600;
+}
+
+.status span {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #8b95a5;
+}
+
+.status-open span {
+  background: #1f9d55;
+}
+
+.status-error span {
+  background: #d63d3d;
+}
+
+.panel {
+  background: #ffffff;
+  border: 1px solid #dbe2ec;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.viewer {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0b0f16;
+  border: 1px solid #1f2937;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+
+.viewer video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0b0f16;
+}
+
+.videoHud {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 70%);
+  color: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.meta {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin: 0;
+}
+
+.meta div {
+  min-width: 0;
+}
+
+.meta dt {
+  font-size: 12px;
+  color: #596579;
+  margin-bottom: 6px;
+}
+
+.meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.logPanel {
+  min-height: 360px;
+}
+
+.logList {
+  display: grid;
+  gap: 8px;
+}
+
+.logLine {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fbfcfe;
+}
+
+.logLine time {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.logLine code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.logLine.in {
+  border-left: 3px solid #1f9d55;
+}
+
+.logLine.out {
+  border-left: 3px solid #2563eb;
+}
+
+.logLine.system {
+  border-left: 3px solid #8b95a5;
+}
+
+.empty {
+  color: #6b7280;
+}
+
+@media (max-width: 700px) {
+  .shell {
+    width: min(100vw - 20px, 1120px);
+    padding: 20px 0;
+  }
+
+  .toolbar,
+  .meta {
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .status {
+    width: 100%;
+  }
+
+  .logLine {
+    grid-template-columns: 1fr;
+  }
+}
