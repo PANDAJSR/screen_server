@@ -160,6 +160,8 @@ func buildFFmpegArgs(cfg FFmpegConfig) []string {
 	switch runtime.GOOS {
 	case "darwin":
 		return buildDarwinArgs(cfg)
+	case "windows":
+		return buildWindowsArgs(cfg)
 	default:
 		return buildX11Args(cfg)
 	}
@@ -284,6 +286,31 @@ func buildX11Args(cfg FFmpegConfig) []string {
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
 		"-i", cfg.Device,
 		"-an",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-b:v", cfg.Bitrate,
+		"-maxrate", cfg.MaxRate,
+		"-bufsize", cfg.BufferSize,
+		"-g", fmt.Sprintf("%d", cfg.GOP),
+		"-bf", "0",
+		"-profile:v", "baseline",
+		"-bsf:v", "h264_metadata=aud=insert",
+		"-f", "h264",
+		"pipe:1",
+	}
+}
+
+func buildWindowsArgs(cfg FFmpegConfig) []string {
+	return []string{
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-fflags", "nobuffer",
+		"-f", "gdigrab",
+		"-framerate", fmt.Sprintf("%d", cfg.FPS),
+		"-i", "desktop",
+		"-an",
+		"-vf", "format=yuv420p",
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
