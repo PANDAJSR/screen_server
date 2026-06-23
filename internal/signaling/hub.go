@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"screen_server/internal/input"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -26,6 +28,7 @@ type Hub struct {
 	inbound    chan inboundMessage
 	rooms      map[string]map[*Client]bool
 	handler    ServerHandler
+	inputCtrl  input.Controller
 }
 
 type inboundMessage struct {
@@ -33,14 +36,26 @@ type inboundMessage struct {
 	message Message
 }
 
-func NewHub(handler ServerHandler) *Hub {
-	return &Hub{
+func NewHub(handler ServerHandler) (*Hub, error) {
+	inputCtrl, err := input.NewController()
+	if err != nil {
+		log.Printf("input controller not available: %v", err)
+	}
+
+	hub := &Hub{
 		register:   make(chan *Client, 16),
 		unregister: make(chan *Client, 16),
 		inbound:    make(chan inboundMessage, 128),
 		rooms:      make(map[string]map[*Client]bool),
 		handler:    handler,
+		inputCtrl:  inputCtrl,
 	}
+
+	if inputCtrl != nil {
+		go hub.cursorPoll()
+	}
+
+	return hub, nil
 }
 
 func (h *Hub) Run() {
@@ -60,6 +75,21 @@ func (h *Hub) Run() {
 					"room":     client.room,
 				}),
 			})
+
+			if h.inputCtrl != nil {
+				if w, h, err := h.inputCtrl.GetScreenSize(); err == nil {
+					client.sendJSON(Message{
+						Type: MessageTypeScreenSize,
+						Room: client.room,
+						To:   client.id,
+						Payload: mustJSON(struct {
+							Width  int `json:"width"`
+							Height int `json:"height"`
+						}{Width: w, Height: h}),
+					})
+				}
+			}
+
 			h.broadcast(client.room, client, Message{
 				Type: MessageTypePeerJoined,
 				Room: client.room,
@@ -92,10 +122,15 @@ func (h *Hub) Run() {
 			msg.Room = inbound.client.room
 			msg.From = inbound.client.id
 			if msg.Type == MessageTypePing {
+				var ts int64
+				_ = json.Unmarshal(msg.Payload, &ts)
 				inbound.client.sendJSON(Message{
 					Type: MessageTypePong,
 					Room: inbound.client.room,
 					To:   inbound.client.id,
+					Payload: mustJSON(map[string]int64{
+						"ts": ts,
+					}),
 				})
 				continue
 			}
@@ -114,11 +149,125 @@ func (h *Hub) Run() {
 				go h.handler.OnSignal(context.Background(), signal)
 				continue
 			}
+			if h.handleInputMessage(msg) {
+				continue
+			}
 			if msg.To != "" {
 				h.sendTo(inbound.client.room, msg.To, msg)
 				continue
 			}
 			h.broadcast(inbound.client.room, inbound.client, msg)
+		}
+	}
+}
+
+func (h *Hub) handleInputMessage(msg Message) bool {
+	if h.inputCtrl == nil {
+		return false
+	}
+
+	switch msg.Type {
+	case MessageTypeInputMouseMove:
+		var ev struct {
+			X int `json:"x"`
+			Y int `json:"y"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input mousemove parse error: %v", err)
+			return true
+		}
+		if err := h.inputCtrl.MoveMouse(ev.X, ev.Y); err != nil {
+			log.Printf("input mousemove error: %v", err)
+		}
+
+	case MessageTypeInputMouseBtn:
+		var ev struct {
+			Button  int  `json:"button"`
+			Pressed bool `json:"pressed"`
+			X       int  `json:"x"`
+			Y       int  `json:"y"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input mousebtn parse error: %v", err)
+			return true
+		}
+		btn := input.MouseButton(ev.Button)
+		if ev.Pressed {
+			h.inputCtrl.PressMouse(btn, ev.X, ev.Y)
+		} else {
+			h.inputCtrl.ReleaseMouse(btn, ev.X, ev.Y)
+		}
+
+	case MessageTypeInputScroll:
+		var ev struct {
+			DX int `json:"dx"`
+			DY int `json:"dy"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input scroll parse error: %v", err)
+			return true
+		}
+		if err := h.inputCtrl.Scroll(ev.DX, ev.DY); err != nil {
+			log.Printf("input scroll error: %v", err)
+		}
+
+	case MessageTypeInputKeyDown:
+		var ev struct {
+			KeyCode int `json:"keyCode"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input keydown parse error: %v", err)
+			return true
+		}
+		if err := h.inputCtrl.PressKey(ev.KeyCode); err != nil {
+			log.Printf("input keydown error: %v", err)
+		}
+
+	case MessageTypeInputKeyUp:
+		var ev struct {
+			KeyCode int `json:"keyCode"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input keyup parse error: %v", err)
+			return true
+		}
+		if err := h.inputCtrl.ReleaseKey(ev.KeyCode); err != nil {
+			log.Printf("input keyup error: %v", err)
+		}
+
+	default:
+		return false
+	}
+	return true
+}
+
+func (h *Hub) cursorPoll() {
+	ticker := time.NewTicker(time.Second / 30)
+	defer ticker.Stop()
+
+	var lastX, lastY int
+	for range ticker.C {
+		if h.inputCtrl == nil {
+			continue
+		}
+		x, y, err := h.inputCtrl.GetCursorPos()
+		if err != nil {
+			continue
+		}
+		if x != lastX || y != lastY {
+			lastX, lastY = x, y
+			for room := range h.rooms {
+				for client := range h.rooms[room] {
+					client.sendJSON(Message{
+						Type: MessageTypeCursorPos,
+						Room: room,
+						Payload: mustJSON(struct {
+							X int `json:"x"`
+							Y int `json:"y"`
+						}{X: x, Y: y}),
+					})
+				}
+			}
 		}
 	}
 }

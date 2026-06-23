@@ -8,7 +8,15 @@ export type SignalType =
   | 'offer'
   | 'answer'
   | 'candidate'
-  | 'error';
+  | 'error'
+  | 'input-mode'
+  | 'input-mousemove'
+  | 'input-mousebtn'
+  | 'input-scroll'
+  | 'input-keydown'
+  | 'input-keyup'
+  | 'cursor-pos'
+  | 'screen-size';
 
 export interface SignalMessage<TPayload = unknown> {
   type: SignalType;

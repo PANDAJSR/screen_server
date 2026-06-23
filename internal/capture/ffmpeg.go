@@ -307,6 +307,7 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 		"-loglevel", "warning",
 		"-fflags", "nobuffer",
 		"-f", "gdigrab",
+		"-draw_mouse", "0",
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
 		"-i", "desktop",
 		"-an",

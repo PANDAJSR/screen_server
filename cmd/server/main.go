@@ -20,7 +20,10 @@ func main() {
 		log.Fatalf("create rtc manager: %v", err)
 	}
 
-	hub := signaling.NewHub(rtcManager)
+	hub, err := signaling.NewHub(rtcManager)
+	if err != nil {
+		log.Fatalf("create signaling hub: %v", err)
+	}
 	go hub.Run()
 
 	mux := http.NewServeMux()
