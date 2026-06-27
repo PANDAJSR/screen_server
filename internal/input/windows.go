@@ -32,31 +32,43 @@ func mouseButtonPress(btn MouseButton, pressed bool) error {
 	var downFlags, upFlags uint32
 	switch btn {
 	case MouseButtonLeft:
-		downFlags = 0x0002
-		upFlags = 0x0004
+		downFlags = _MOUSEEVENTF_LEFTDOWN
+		upFlags = _MOUSEEVENTF_LEFTUP
 	case MouseButtonRight:
-		downFlags = 0x0008
-		upFlags = 0x0010
+		downFlags = _MOUSEEVENTF_RIGHTDOWN
+		upFlags = _MOUSEEVENTF_RIGHTUP
 	case MouseButtonMiddle:
-		downFlags = 0x0020
-		upFlags = 0x0040
+		downFlags = _MOUSEEVENTF_MIDDLEDOWN
+		upFlags = _MOUSEEVENTF_MIDDLEUP
 	}
 	if pressed {
-		return mouseEvent(downFlags, 0, 0)
+		return sendMouseInput(downFlags, 0, 0, 0)
 	}
-	return mouseEvent(upFlags, 0, 0)
+	return sendMouseInput(upFlags, 0, 0, 0)
 }
 
 func (c *windowsController) Scroll(dx, dy int) error {
-	return mouseEvent(0x0800, uint32(dy)*120, 0)
+	// Send vertical wheel event
+	if dy != 0 {
+		if err := sendMouseInput(_MOUSEEVENTF_WHEEL, 0, 0, uint32(dy)*_WHEEL_DELTA); err != nil {
+			return err
+		}
+	}
+	// Send horizontal wheel event
+	if dx != 0 {
+		if err := sendMouseInput(_MOUSEEVENTF_HWHEEL, 0, 0, uint32(dx)*_WHEEL_DELTA); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *windowsController) PressKey(keyCode int) error {
-	return keybdEvent(uint16(keyCode), 0, 0)
+	return sendKeybdInput(uint16(keyCode), 0)
 }
 
 func (c *windowsController) ReleaseKey(keyCode int) error {
-	return keybdEvent(uint16(keyCode), 0, 2)
+	return sendKeybdInput(uint16(keyCode), _KEYEVENTF_KEYUP)
 }
 
 func (c *windowsController) GetKeyState() ([]int, error) {
@@ -69,9 +81,7 @@ func (c *windowsController) ReleaseAllKeys() error {
 		return err
 	}
 	for _, keyCode := range pressed {
-		// KEYEVENTF_KEYUP = 0x0002
-		if kerr := keybdEvent(uint16(keyCode), 0, 0x0002); kerr != nil {
-			// Collect first error but keep trying to release all keys
+		if kerr := sendKeybdInput(uint16(keyCode), _KEYEVENTF_KEYUP); kerr != nil {
 			if err == nil {
 				err = kerr
 			}
@@ -99,13 +109,14 @@ func (c *windowsController) GetCursorPos() (x, y int, err error) {
 }
 
 func (c *windowsController) SetCursorPos(x, y int) error {
-	user32 := windows.NewLazyDLL("user32.dll")
-	setCursorPosProc := user32.NewProc("SetCursorPos")
-	r1, _, _ := setCursorPosProc.Call(uintptr(x), uintptr(y))
-	if r1 == 0 {
-		return windows.GetLastError()
+	w, h, err := c.GetScreenSize()
+	if err != nil {
+		return err
 	}
-	return nil
+	dx := normalizedAbsolute(x, w)
+	dy := normalizedAbsolute(y, h)
+	flags := uint32(_MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_VIRTUALDESK)
+	return sendMouseInput(flags, dx, dy, 0)
 }
 
 func (c *windowsController) GetScreenSize() (width, height int, err error) {
@@ -418,26 +429,128 @@ func encodeCursorPNG(img image.Image, w, h, hotspotX, hotspotY int) (*CursorInfo
 	}, nil
 }
 
-// ---- low-level input helpers (unchanged signatures) --------------------------
+// ---- SendInput structs and helpers ------------------------------------------
+//
+// We replace the deprecated mouse_event / keybd_event / SetCursorPos with
+// SendInput so that synthesized input flows through the full input pipeline —
+// including DWM cursor rendering. This fixes the issue where SetCursorPos moved
+// the logical cursor (apps saw hover) but the visible cursor sprite did not
+// update (PowerToys crosshair / screen capture showed no movement).
 
-func mouseMove(x, y int32) error {
+const (
+	_INPUT_MOUSE    = 0
+	_INPUT_KEYBOARD = 1
+)
+
+// Flags for MOUSEINPUT.dwFlags
+const (
+	_MOUSEEVENTF_MOVE       = 0x0001
+	_MOUSEEVENTF_LEFTDOWN   = 0x0002
+	_MOUSEEVENTF_LEFTUP     = 0x0004
+	_MOUSEEVENTF_RIGHTDOWN  = 0x0008
+	_MOUSEEVENTF_RIGHTUP    = 0x0010
+	_MOUSEEVENTF_MIDDLEDOWN = 0x0020
+	_MOUSEEVENTF_MIDDLEUP   = 0x0040
+	_MOUSEEVENTF_ABSOLUTE   = 0x8000
+	_MOUSEEVENTF_WHEEL      = 0x0800
+	_MOUSEEVENTF_HWHEEL     = 0x1000
+	_MOUSEEVENTF_VIRTUALDESK = 0x4000
+	_WHEEL_DELTA             = 120
+)
+
+// Flags for KEYBDINPUT.dwFlags
+const (
+	_KEYEVENTF_KEYUP = 0x0002
+)
+
+type _MOUSEINPUT struct {
+	Dx          int32
+	Dy          int32
+	MouseData   uint32
+	DwFlags     uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+type _KEYBDINPUT struct {
+	WVk         uint16
+	WScan       uint16
+	DwFlags     uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+// sendMouseInput sends a single mouse input event via SendInput.
+func sendMouseInput(flags uint32, dx, dy int32, mouseData uint32) error {
 	user32 := windows.NewLazyDLL("user32.dll")
-	mouseEventProc := user32.NewProc("mouse_event")
-	r1, _, _ := mouseEventProc.Call(0x0001, uintptr(x), uintptr(y), 0, 0)
+	sendInputProc := user32.NewProc("SendInput")
+
+	// INPUT struct layout on x64:
+	//   offset 0: type (uint32, 4 bytes)
+	//   offset 4: padding (4 bytes for union alignment)
+	//   offset 8: union data (MOUSEINPUT = 32 bytes)
+	// total: 40 bytes
+	const inputSize = 40
+	var buf [inputSize]byte
+
+	// type = INPUT_MOUSE
+	*(*uint32)(unsafe.Pointer(&buf[0])) = _INPUT_MOUSE
+
+	// MOUSEINPUT at offset 8
+	mi := (*_MOUSEINPUT)(unsafe.Pointer(&buf[8]))
+	mi.Dx = dx
+	mi.Dy = dy
+	mi.MouseData = mouseData
+	mi.DwFlags = flags
+	mi.Time = 0
+	mi.DwExtraInfo = 0
+
+	r1, _, _ := sendInputProc.Call(1, uintptr(unsafe.Pointer(&buf[0])), uintptr(inputSize))
 	if r1 == 0 {
 		return windows.GetLastError()
 	}
 	return nil
 }
 
-func mouseEvent(flags, xData, yData uint32) error {
+// sendKeybdInput sends a single keyboard input event via SendInput.
+func sendKeybdInput(vk uint16, flags uint32) error {
 	user32 := windows.NewLazyDLL("user32.dll")
-	mouseEventProc := user32.NewProc("mouse_event")
-	r1, _, _ := mouseEventProc.Call(uintptr(flags), uintptr(xData), uintptr(yData), 0, 0)
+	sendInputProc := user32.NewProc("SendInput")
+
+	// INPUT struct for keyboard:
+	//   offset 0: type (uint32, 4 bytes)
+	//   offset 4: padding (4 bytes)
+	//   offset 8: KEYBDINPUT (24 bytes)
+	// total: 32 bytes
+	const inputSize = 32
+	var buf [inputSize]byte
+
+	*(*uint32)(unsafe.Pointer(&buf[0])) = _INPUT_KEYBOARD
+
+	ki := (*_KEYBDINPUT)(unsafe.Pointer(&buf[8]))
+	ki.WVk = vk
+	ki.WScan = 0
+	ki.DwFlags = flags
+	ki.Time = 0
+	ki.DwExtraInfo = 0
+
+	r1, _, _ := sendInputProc.Call(1, uintptr(unsafe.Pointer(&buf[0])), uintptr(inputSize))
 	if r1 == 0 {
 		return windows.GetLastError()
 	}
 	return nil
+}
+
+// normalizedAbsolute converts a pixel coordinate to the 0–65535 absolute range
+// required by SendInput with MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESKTOP.
+func normalizedAbsolute(pixel, screenDim int) int32 {
+	// The canonical formula: (pixel * 65536) / screenDim
+	// where 65536 represents the full normalized range [0, 65535]
+	return int32((pixel * 65536) / screenDim)
+}
+
+func mouseMove(x, y int32) error {
+	return sendMouseInput(_MOUSEEVENTF_MOVE, x, y, 0)
 }
 
 func getKeyState() ([]int, error) {
@@ -453,14 +566,4 @@ func getKeyState() ([]int, error) {
 		}
 	}
 	return pressed, nil
-}
-
-func keybdEvent(key uint16, scan uint16, flags uint32) error {
-	user32 := windows.NewLazyDLL("user32.dll")
-	keybdEventProc := user32.NewProc("keybd_event")
-	r1, _, _ := keybdEventProc.Call(uintptr(key), uintptr(scan), uintptr(flags), 0)
-	if r1 == 0 {
-		return windows.GetLastError()
-	}
-	return nil
 }
