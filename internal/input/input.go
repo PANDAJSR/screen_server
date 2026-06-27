@@ -57,6 +57,8 @@ type Controller interface {
 	GetCursorInfo() (*CursorInfo, error)
 	GetScreenSize() (width, height int, err error)
 	SetCursorPos(x, y int) error
+	GetKeyState() ([]int, error)
+	ReleaseAllKeys() error
 	Close() error
 }
 

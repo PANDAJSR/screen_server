@@ -28,6 +28,8 @@ const (
 	MessageTypeCursorPos          = "cursor-pos"           // cursor position update from server
 	MessageTypeCursorImage        = "cursor-image"         // cursor image data from server
 	MessageTypeScreenSize         = "screen-size"          // screen dimensions from server
+	MessageTypeInputKeyState      = "input-key-state"      // server → client: currently pressed keys
+	MessageTypeInputReleaseAll    = "input-release-all"    // client → server: release all keys
 )
 
 // Message is the only JSON envelope used by the signaling channel.

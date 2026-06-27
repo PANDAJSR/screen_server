@@ -59,6 +59,27 @@ func (c *windowsController) ReleaseKey(keyCode int) error {
 	return keybdEvent(uint16(keyCode), 0, 2)
 }
 
+func (c *windowsController) GetKeyState() ([]int, error) {
+	return getKeyState()
+}
+
+func (c *windowsController) ReleaseAllKeys() error {
+	pressed, err := getKeyState()
+	if err != nil {
+		return err
+	}
+	for _, keyCode := range pressed {
+		// KEYEVENTF_KEYUP = 0x0002
+		if kerr := keybdEvent(uint16(keyCode), 0, 0x0002); kerr != nil {
+			// Collect first error but keep trying to release all keys
+			if err == nil {
+				err = kerr
+			}
+		}
+	}
+	return err
+}
+
 func (c *windowsController) Close() error {
 	return nil
 }
@@ -417,6 +438,21 @@ func mouseEvent(flags, xData, yData uint32) error {
 		return windows.GetLastError()
 	}
 	return nil
+}
+
+func getKeyState() ([]int, error) {
+	user32 := windows.NewLazyDLL("user32.dll")
+	getAsyncKeyStateProc := user32.NewProc("GetAsyncKeyState")
+
+	var pressed []int
+	for vk := 1; vk <= 254; vk++ {
+		ret, _, _ := getAsyncKeyStateProc.Call(uintptr(vk))
+		// MSB (bit 15) set = key is currently down
+		if ret&0x8000 != 0 {
+			pressed = append(pressed, vk)
+		}
+	}
+	return pressed, nil
 }
 
 func keybdEvent(key uint16, scan uint16, flags uint32) error {

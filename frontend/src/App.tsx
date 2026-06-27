@@ -1,5 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createSignalingSocket, type SignalMessage } from './signaling';
+
+// ---- Key code → readable name mapping ----
+
+const KEY_CODE_NAMES: Record<number, string> = {
+  3: 'Pause', 8: 'Backspace', 9: 'Tab', 12: 'Clear', 13: 'Enter',
+  16: 'Shift', 17: 'Ctrl', 18: 'Alt', 19: 'Pause', 20: 'CapsLock',
+  27: 'Esc', 32: 'Space', 33: 'PageUp', 34: 'PageDown', 35: 'End', 36: 'Home',
+  37: '←', 38: '↑', 39: '→', 40: '↓',
+  44: 'PrtSc', 45: 'Insert', 46: 'Delete',
+  48: '0', 49: '1', 50: '2', 51: '3', 52: '4', 53: '5', 54: '6', 55: '7', 56: '8', 57: '9',
+  65: 'A', 66: 'B', 67: 'C', 68: 'D', 69: 'E', 70: 'F', 71: 'G', 72: 'H',
+  73: 'I', 74: 'J', 75: 'K', 76: 'L', 77: 'M', 78: 'N', 79: 'O',
+  80: 'P', 81: 'Q', 82: 'R', 83: 'S', 84: 'T', 85: 'U', 86: 'V',
+  87: 'W', 88: 'X', 89: 'Y', 90: 'Z',
+  91: 'Win', 92: 'Win',
+  96: 'Num0', 97: 'Num1', 98: 'Num2', 99: 'Num3', 100: 'Num4',
+  101: 'Num5', 102: 'Num6', 103: 'Num7', 104: 'Num8', 105: 'Num9',
+  106: 'Num*', 107: 'Num+', 108: 'NumEnter', 109: 'Num-', 110: 'Num.', 111: 'Num/',
+  112: 'F1', 113: 'F2', 114: 'F3', 115: 'F4', 116: 'F5', 117: 'F6',
+  118: 'F7', 119: 'F8', 120: 'F9', 121: 'F10', 122: 'F11', 123: 'F12',
+  144: 'NumLock', 145: 'ScrollLock',
+  160: 'LShift', 161: 'RShift', 162: 'LCtrl', 163: 'RCtrl', 164: 'LAlt', 165: 'RAlt',
+  173: 'Mute', 174: 'Vol-', 175: 'Vol+', 176: 'Next', 177: 'Prev', 178: 'Stop', 179: 'Play',
+  186: ';', 187: '=', 188: ',', 189: '-', 190: '.', 191: '/', 192: '`',
+  219: '[', 220: '\\', 221: ']', 222: '\'',
+};
+
+function keyCodeToName(code: number): string {
+  return KEY_CODE_NAMES[code] ?? `VK${code}`;
+}
 
 type ConnectionState = 'connecting' | 'open' | 'closed' | 'error';
 type CursorMode = 'client' | 'remote';
@@ -191,6 +221,7 @@ export function App() {
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
+  const [remoteKeysPressed, setRemoteKeysPressed] = useState<number[]>([]);
 
   const statusButtonRef = useRef<HTMLButtonElement | null>(null);
   const inputButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -473,6 +504,8 @@ export function App() {
       } else if (message.type === 'screen-size' && message.payload) {
         const size = message.payload as { width: number; height: number };
         setScreenSize({ width: size.width, height: size.height });
+      } else if (message.type === 'input-key-state' && message.payload) {
+        setRemoteKeysPressed(message.payload as number[]);
       }
     };
 
@@ -604,6 +637,12 @@ export function App() {
     setConnectionKey((k) => k + 1);
   };
 
+  const sendReleaseAll = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'input-release-all' }));
+  }, []);
+
   const getOverlayText = () => {
     if (!inputEnabled) return null;
     if (cursorMode === 'remote') {
@@ -667,6 +706,21 @@ export function App() {
               <span className="toggleTrack"><span className="toggleThumb" /></span>
               <span className="toggleLabel">客户端光标</span>
             </label>
+          </div>
+          <div className="keyStateSection">
+            <span className="keyStateLabel">远端按键</span>
+            {remoteKeysPressed.length === 0 ? (
+              <span className="keyStateEmpty">无按键按下</span>
+            ) : (
+              <div className="keyStatePills">
+                {remoteKeysPressed.map((code) => (
+                  <span key={code} className="keyStatePill">{keyCodeToName(code)}</span>
+                ))}
+              </div>
+            )}
+            <button className="releaseAllBtn" onClick={sendReleaseAll} disabled={remoteKeysPressed.length === 0}>
+              松开全部按键
+            </button>
           </div>
           <div className="inputHint">
             {cursorMode === 'remote'

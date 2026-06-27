@@ -38,6 +38,14 @@ func (c *linuxController) ReleaseKey(keyCode int) error {
 	return fmt.Errorf("linux input not fully implemented")
 }
 
+func (c *linuxController) GetKeyState() ([]int, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (c *linuxController) ReleaseAllKeys() error {
+	return fmt.Errorf("not implemented")
+}
+
 func (c *linuxController) Close() error {
 	return nil
 }

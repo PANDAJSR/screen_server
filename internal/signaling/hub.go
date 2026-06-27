@@ -54,6 +54,7 @@ func NewHub(handler ServerHandler) (*Hub, error) {
 	if inputCtrl != nil {
 		go hub.cursorPoll()
 		go hub.cursorImagePoll()
+		go hub.keyStatePoll()
 	}
 
 	return hub, nil
@@ -263,6 +264,11 @@ func (h *Hub) handleInputMessage(msg Message) bool {
 			log.Printf("input keyup error: %v", err)
 		}
 
+	case MessageTypeInputReleaseAll:
+		if err := h.inputCtrl.ReleaseAllKeys(); err != nil {
+			log.Printf("input release-all error: %v", err)
+		}
+
 	default:
 		return false
 	}
@@ -331,6 +337,37 @@ func (h *Hub) cursorImagePoll() {
 						HotspotX int    `json:"hotspotX"`
 						HotspotY int    `json:"hotspotY"`
 					}{Data: info.ImageData, Width: info.Width, Height: info.Height, HotspotX: info.HotspotX, HotspotY: info.HotspotY}),
+				})
+			}
+		}
+	}
+}
+func (h *Hub) keyStatePoll() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastKeys string
+	for range ticker.C {
+		if h.inputCtrl == nil {
+			continue
+		}
+		keys, err := h.inputCtrl.GetKeyState()
+		if err != nil {
+			continue
+		}
+		// Only broadcast when key state changes
+		keyJSON, _ := json.Marshal(keys)
+		keyStr := string(keyJSON)
+		if keyStr == lastKeys {
+			continue
+		}
+		lastKeys = keyStr
+		for room := range h.rooms {
+			for client := range h.rooms[room] {
+				client.sendJSON(Message{
+					Type:    MessageTypeInputKeyState,
+					Room:    room,
+					Payload: keyJSON,
 				})
 			}
 		}

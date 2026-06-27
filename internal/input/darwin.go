@@ -38,6 +38,14 @@ func (c *darwinController) ReleaseKey(keyCode int) error {
 	return fmt.Errorf("darwin input not fully implemented")
 }
 
+func (c *darwinController) GetKeyState() ([]int, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (c *darwinController) ReleaseAllKeys() error {
+	return fmt.Errorf("not implemented")
+}
+
 func (c *darwinController) Close() error {
 	return nil
 }
