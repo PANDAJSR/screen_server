@@ -3,16 +3,16 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev:backend": "go run ./cmd/server",
-    "dev:backend:testsrc": "SCREEN_SERVER_CAPTURE_INPUT=testsrc go run ./cmd/server",
-    "dev:backend:screencap": "SCREEN_SERVER_CAPTURE_INPUT=screencapture SCREEN_SERVER_CAPTURE_DISPLAY=2 SCREEN_SERVER_CAPTURE_FPS=30 go run ./cmd/server",
-    "dev:backend:screen0": "SCREEN_SERVER_CAPTURE_DEVICE='2:none' go run ./cmd/server",
-    "dev:backend:screen1": "SCREEN_SERVER_CAPTURE_DEVICE='3:none' go run ./cmd/server",
+    "dev:backend": "D:/Software/Go/go/bin/go.exe run ./cmd/server",
+    "dev:backend:testsrc": "SCREEN_SERVER_CAPTURE_INPUT=testsrc D:/Software/Go/go/bin/go.exe run ./cmd/server",
+    "dev:backend:screencap": "SCREEN_SERVER_CAPTURE_INPUT=screencapture SCREEN_SERVER_CAPTURE_DISPLAY=2 SCREEN_SERVER_CAPTURE_FPS=30 D:/Software/Go/go/bin/go.exe run ./cmd/server",
+    "dev:backend:screen0": "SCREEN_SERVER_CAPTURE_DEVICE='2:none' D:/Software/Go/go/bin/go.exe run ./cmd/server",
+    "dev:backend:screen1": "SCREEN_SERVER_CAPTURE_DEVICE='3:none' D:/Software/Go/go/bin/go.exe run ./cmd/server",
     "dev:frontend": "npm --prefix frontend run dev",
     "build:frontend": "npm --prefix frontend run build",
     "verify:live": "npm --prefix frontend run verify:live",
-    "test:backend": "go test ./...",
-    "capture:smoke": "go run ./cmd/capture-smoke",
+    "test:backend": "D:/Software/Go/go/bin/go.exe test ./...",
+    "capture:smoke": "D:/Software/Go/go/bin/go.exe run ./cmd/capture-smoke",
     "format:backend": "gofmt -w cmd/server/main.go cmd/capture-smoke/main.go internal/signaling/*.go internal/capture/*.go internal/rtc/*.go"
   }
 }

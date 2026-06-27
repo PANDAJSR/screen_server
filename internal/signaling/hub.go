@@ -200,14 +200,14 @@ func (h *Hub) handleInputMessage(msg Message) bool {
 
 	case MessageTypeInputScroll:
 		var ev struct {
-			DX int `json:"dx"`
-			DY int `json:"dy"`
+			DX float64 `json:"dx"`
+			DY float64 `json:"dy"`
 		}
 		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
 			log.Printf("input scroll parse error: %v", err)
 			return true
 		}
-		if err := h.inputCtrl.Scroll(ev.DX, ev.DY); err != nil {
+		if err := h.inputCtrl.Scroll(int(ev.DX), int(ev.DY)); err != nil {
 			log.Printf("input scroll error: %v", err)
 		}
 
