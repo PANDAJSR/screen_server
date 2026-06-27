@@ -46,6 +46,14 @@ func (c *darwinController) GetCursorPos() (x, y int, err error) {
 	return 0, 0, fmt.Errorf("not implemented")
 }
 
+func (c *darwinController) GetCursorInfo() (*CursorInfo, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (c *darwinController) SetCursorPos(x, y int) error {
+	return fmt.Errorf("not implemented")
+}
+
 func (c *darwinController) GetScreenSize() (width, height int, err error) {
 	return 0, 0, fmt.Errorf("not implemented")
 }

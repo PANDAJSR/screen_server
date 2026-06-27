@@ -46,6 +46,14 @@ func (c *linuxController) GetCursorPos() (x, y int, err error) {
 	return 0, 0, fmt.Errorf("not implemented")
 }
 
+func (c *linuxController) GetCursorInfo() (*CursorInfo, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (c *linuxController) SetCursorPos(x, y int) error {
+	return fmt.Errorf("not implemented")
+}
+
 func (c *linuxController) GetScreenSize() (width, height int, err error) {
 	return 0, 0, fmt.Errorf("not implemented")
 }

@@ -11,11 +11,13 @@ export type SignalType =
   | 'error'
   | 'input-mode'
   | 'input-mousemove'
+  | 'input-mousemove-abs'
   | 'input-mousebtn'
   | 'input-scroll'
   | 'input-keydown'
   | 'input-keyup'
   | 'cursor-pos'
+  | 'cursor-image'
   | 'screen-size';
 
 export interface SignalMessage<TPayload = unknown> {

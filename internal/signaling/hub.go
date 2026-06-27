@@ -53,6 +53,7 @@ func NewHub(handler ServerHandler) (*Hub, error) {
 
 	if inputCtrl != nil {
 		go hub.cursorPoll()
+		go hub.cursorImagePoll()
 	}
 
 	return hub, nil
@@ -86,6 +87,20 @@ func (h *Hub) Run() {
 							Width  int `json:"width"`
 							Height int `json:"height"`
 						}{Width: w, Height: h}),
+					})
+				}
+				if info, err := h.inputCtrl.GetCursorInfo(); err == nil && info != nil {
+					client.sendJSON(Message{
+						Type: MessageTypeCursorImage,
+						Room: client.room,
+						To:   client.id,
+						Payload: mustJSON(struct {
+							Data     string `json:"data"`
+							Width    int    `json:"width"`
+							Height   int    `json:"height"`
+							HotspotX int    `json:"hotspotX"`
+							HotspotY int    `json:"hotspotY"`
+						}{Data: info.ImageData, Width: info.Width, Height: info.Height, HotspotX: info.HotspotX, HotspotY: info.HotspotY}),
 					})
 				}
 			}
@@ -180,6 +195,19 @@ func (h *Hub) handleInputMessage(msg Message) bool {
 			log.Printf("input mousemove error: %v", err)
 		}
 
+	case MessageTypeInputMouseMoveAbs:
+		var ev struct {
+			X int `json:"x"`
+			Y int `json:"y"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input mousemove-abs parse error: %v", err)
+			return true
+		}
+		if err := h.inputCtrl.SetCursorPos(ev.X, ev.Y); err != nil {
+			log.Printf("input mousemove-abs error: %v", err)
+		}
+
 	case MessageTypeInputMouseBtn:
 		var ev struct {
 			Button  int  `json:"button"`
@@ -267,6 +295,43 @@ func (h *Hub) cursorPoll() {
 						}{X: x, Y: y}),
 					})
 				}
+			}
+		}
+	}
+}
+
+func (h *Hub) cursorImagePoll() {
+	ticker := time.NewTicker(time.Second / 10)
+	defer ticker.Stop()
+
+	var lastData string
+	for range ticker.C {
+		if h.inputCtrl == nil {
+			continue
+		}
+		info, err := h.inputCtrl.GetCursorInfo()
+		if err != nil || info == nil {
+			continue
+		}
+		// Only send when the cursor image actually changed
+		if info.ImageData == lastData {
+			continue
+		}
+		lastData = info.ImageData
+
+		for room := range h.rooms {
+			for client := range h.rooms[room] {
+				client.sendJSON(Message{
+					Type: MessageTypeCursorImage,
+					Room: room,
+					Payload: mustJSON(struct {
+						Data     string `json:"data"`
+						Width    int    `json:"width"`
+						Height   int    `json:"height"`
+						HotspotX int    `json:"hotspotX"`
+						HotspotY int    `json:"hotspotY"`
+					}{Data: info.ImageData, Width: info.Width, Height: info.Height, HotspotX: info.HotspotX, HotspotY: info.HotspotY}),
+				})
 			}
 		}
 	}

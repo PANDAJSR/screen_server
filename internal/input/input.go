@@ -37,6 +37,15 @@ type KeyEvent struct {
 	Pressed bool
 }
 
+// CursorInfo holds the current OS cursor image and hotspot.
+type CursorInfo struct {
+	ImageData string // base64-encoded PNG
+	Width     int
+	Height    int
+	HotspotX  int
+	HotspotY  int
+}
+
 type Controller interface {
 	MoveMouse(x, y int) error
 	PressMouse(btn MouseButton, x, y int) error
@@ -45,7 +54,9 @@ type Controller interface {
 	PressKey(keyCode int) error
 	ReleaseKey(keyCode int) error
 	GetCursorPos() (x, y int, err error)
+	GetCursorInfo() (*CursorInfo, error)
 	GetScreenSize() (width, height int, err error)
+	SetCursorPos(x, y int) error
 	Close() error
 }
 

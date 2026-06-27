@@ -18,14 +18,16 @@ const (
 	MessageTypeError       = "error"
 
 	// Input control message types
-	MessageTypeInputMode      = "input-mode"       // enable/disable control mode
-	MessageTypeInputKeyDown   = "input-keydown"    // key press
-	MessageTypeInputKeyUp     = "input-keyup"      // key release
-	MessageTypeInputMouseMove = "input-mousemove"  // mouse movement
-	MessageTypeInputMouseBtn  = "input-mousebtn"   // mouse button press/release
-	MessageTypeInputScroll    = "input-scroll"     // mouse scroll
-	MessageTypeCursorPos      = "cursor-pos"       // cursor position update from server
-	MessageTypeScreenSize     = "screen-size"      // screen dimensions from server
+	MessageTypeInputMode          = "input-mode"           // enable/disable control mode
+	MessageTypeInputKeyDown       = "input-keydown"        // key press
+	MessageTypeInputKeyUp         = "input-keyup"          // key release
+	MessageTypeInputMouseMove     = "input-mousemove"      // relative mouse movement
+	MessageTypeInputMouseMoveAbs  = "input-mousemove-abs"  // absolute mouse position
+	MessageTypeInputMouseBtn      = "input-mousebtn"       // mouse button press/release
+	MessageTypeInputScroll        = "input-scroll"         // mouse scroll
+	MessageTypeCursorPos          = "cursor-pos"           // cursor position update from server
+	MessageTypeCursorImage        = "cursor-image"         // cursor image data from server
+	MessageTypeScreenSize         = "screen-size"          // screen dimensions from server
 )
 
 // Message is the only JSON envelope used by the signaling channel.
