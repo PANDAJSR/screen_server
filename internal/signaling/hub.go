@@ -317,12 +317,19 @@ func (h *Hub) cursorImagePoll() {
 		}
 		info, err := h.inputCtrl.GetCursorInfo()
 		if err != nil || info == nil {
+			if err != nil {
+				log.Printf("[cursor-poll] GetCursorInfo error: %v", err)
+			} else {
+				log.Printf("[cursor-poll] GetCursorInfo returned nil")
+			}
 			continue
 		}
 		// Only send when the cursor image actually changed
 		if info.ImageData == lastData {
 			continue
 		}
+		log.Printf("[cursor-poll] cursor changed: %dx%d hotspot=(%d,%d) dataLen=%d → broadcasting to clients",
+			info.Width, info.Height, info.HotspotX, info.HotspotY, len(info.ImageData))
 		lastData = info.ImageData
 
 		for room := range h.rooms {

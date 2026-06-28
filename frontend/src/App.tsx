@@ -517,7 +517,11 @@ export function App() {
         const pos = message.payload as { x: number; y: number };
         setCursorPos({ x: pos.x, y: pos.y });
       } else if (message.type === 'cursor-image' && message.payload) {
-        setCursorImage(message.payload as CursorImagePayload);
+        const ci = message.payload as CursorImagePayload;
+        console.log('[cursor-client] received:', ci.width + 'x' + ci.height,
+          'hotspot=(' + ci.hotspotX + ',' + ci.hotspotY + ')',
+          'dataLen=' + ci.data.length);
+        setCursorImage(ci);
       } else if (message.type === 'screen-size' && message.payload) {
         const size = message.payload as { width: number; height: number };
         setScreenSize({ width: size.width, height: size.height });

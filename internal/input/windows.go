@@ -1,10 +1,11 @@
-package input
+﻿package input
 
 import (
 	"bytes"
 	"encoding/base64"
 	"image"
 	"image/png"
+	"log"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -48,13 +49,11 @@ func mouseButtonPress(btn MouseButton, pressed bool) error {
 }
 
 func (c *windowsController) Scroll(dx, dy int) error {
-	// Send vertical wheel event
 	if dy != 0 {
 		if err := sendMouseInput(_MOUSEEVENTF_WHEEL, 0, 0, uint32(dy)*_WHEEL_DELTA); err != nil {
 			return err
 		}
 	}
-	// Send horizontal wheel event
 	if dx != 0 {
 		if err := sendMouseInput(_MOUSEEVENTF_HWHEEL, 0, 0, uint32(dx)*_WHEEL_DELTA); err != nil {
 			return err
@@ -105,7 +104,10 @@ func (c *windowsController) GetCursorPos() (x, y int, err error) {
 	if r1 == 0 {
 		return 0, 0, windows.GetLastError()
 	}
-	return int(pt.X), int(pt.Y), nil
+	getSystemMetricsProc := user32.NewProc("GetSystemMetrics")
+	originX, _, _ := getSystemMetricsProc.Call(76)
+	originY, _, _ := getSystemMetricsProc.Call(77)
+	return int(pt.X) - int(int32(originX)), int(pt.Y) - int(int32(originY)), nil
 }
 
 func (c *windowsController) SetCursorPos(x, y int) error {
@@ -122,8 +124,8 @@ func (c *windowsController) SetCursorPos(x, y int) error {
 func (c *windowsController) GetScreenSize() (width, height int, err error) {
 	user32 := windows.NewLazyDLL("user32.dll")
 	getSystemMetricsProc := user32.NewProc("GetSystemMetrics")
-	w, _, _ := getSystemMetricsProc.Call(0)
-	h, _, _ := getSystemMetricsProc.Call(1)
+	w, _, _ := getSystemMetricsProc.Call(78)
+	h, _, _ := getSystemMetricsProc.Call(79)
 	width = int(int32(w))
 	height = int(int32(h))
 	if width == 0 || height == 0 {
@@ -138,16 +140,14 @@ func (c *windowsController) GetCursorInfo() (*CursorInfo, error) {
 
 // ---- Win32 structs and low-level helpers ------------------------------------
 
-type _point struct {
-	x int32
-	y int32
-}
-
 type _cursorInfoEx struct {
 	cbSize      uint32
 	flags       uint32
 	hCursor     windows.Handle
-	ptScreenPos _point
+	ptScreenPos struct {
+		x int32
+		y int32
+	}
 }
 
 type _iconInfoEx struct {
@@ -190,152 +190,183 @@ func getCursorInfo() (*CursorInfo, error) {
 	ci.cbSize = uint32(unsafe.Sizeof(ci))
 	r1, _, _ := getCursorInfoProc.Call(uintptr(unsafe.Pointer(&ci)))
 	if r1 == 0 {
+		log.Printf("[cursor] GetCursorInfo failed: %v", windows.GetLastError())
 		return nil, windows.GetLastError()
 	}
 
 	if ci.hCursor == 0 {
+		log.Printf("[cursor] GetCursorInfo returned hCursor=0 (cursor hidden or unavailable)")
 		return nil, windows.ERROR_NOT_FOUND
 	}
 
+	log.Printf("[cursor] GetCursorInfo OK hCursor=0x%x flags=0x%x", ci.hCursor, ci.flags)
 	return captureCursorImage(ci.hCursor)
 }
 
+// captureCursorImage uses different strategies depending on cursor type:
+//   - Monochrome (hbmColor==0): decode AND/XOR masks directly (produces correct alpha).
+//   - Color (hbmColor!=0): render via DrawIconEx into a BGRA DIB at the cursor's own size.
 func captureCursorImage(hCursor windows.Handle) (*CursorInfo, error) {
 	user32 := windows.NewLazyDLL("user32.dll")
-	getIconInfoProc := user32.NewProc("GetIconInfo")
+	gdi32 := windows.NewLazyDLL("gdi32.dll")
 
-	var info _iconInfoEx
-	r1, _, _ := getIconInfoProc.Call(uintptr(hCursor), uintptr(unsafe.Pointer(&info)))
+	getIconInfoProc := user32.NewProc("GetIconInfo")
+	var ii _iconInfoEx
+	r1, _, _ := getIconInfoProc.Call(uintptr(hCursor), uintptr(unsafe.Pointer(&ii)))
 	if r1 == 0 {
+		log.Printf("[cursor] GetIconInfo failed for hCursor=0x%x: %v", hCursor, windows.GetLastError())
 		return nil, windows.GetLastError()
 	}
-	// hbmMask and hbmColor must be deleted after use
+	hotspotX := int(ii.xHotspot)
+	hotspotY := int(ii.yHotspot)
+	log.Printf("[cursor] GetIconInfo OK: hbmColor=0x%x hbmMask=0x%x hotspot=(%d,%d) fIcon=%d",
+		ii.hbmColor, ii.hbmMask, hotspotX, hotspotY, ii.fIcon)
+
 	defer func() {
-		gdi32 := windows.NewLazyDLL("gdi32.dll")
-		if info.hbmMask != 0 {
-			gdi32.NewProc("DeleteObject").Call(uintptr(info.hbmMask))
+		if ii.hbmMask != 0 {
+			gdi32.NewProc("DeleteObject").Call(uintptr(ii.hbmMask))
 		}
-		if info.hbmColor != 0 {
-			gdi32.NewProc("DeleteObject").Call(uintptr(info.hbmColor))
+		if ii.hbmColor != 0 {
+			gdi32.NewProc("DeleteObject").Call(uintptr(ii.hbmColor))
 		}
 	}()
 
-	// Prefer the color bitmap for 32-bit cursors
-	if info.hbmColor != 0 {
-		img, w, h, err := dibToNRGBA(info.hbmColor)
+	// ---- Monochrome cursor: decode AND/XOR masks directly ----
+	if ii.hbmColor == 0 && ii.hbmMask != 0 {
+		log.Printf("[cursor] monochrome cursor 鈥?using mask decode path")
+		img, imgW, imgH, err := decodeMaskCursor(ii.hbmMask)
 		if err != nil {
+			log.Printf("[cursor] decodeMaskCursor failed: %v", err)
 			return nil, err
 		}
-		return encodeCursorPNG(img, w, h, int(info.xHotspot), int(info.yHotspot))
+		return encodeCursorPNG(img, imgW, imgH, hotspotX, hotspotY)
 	}
 
-	// Fallback: use the mask bitmap for monochrome cursors
-	if info.hbmMask != 0 {
-		img, w, h, err := maskToNRGBA(info.hbmMask)
-		if err != nil {
-			return nil, err
-		}
-		return encodeCursorPNG(img, w, h, int(info.xHotspot), int(info.yHotspot))
+	// ---- Color cursor: read directly from hbmColor via GetDIBits ----
+	// The colour bitmap (hbmColor) is 32-bit BGRA.  For doubled bitmaps the
+	// top half contains the real colour data with proper alpha; we use the
+	// system cursor height as the authoritative row count.
+	bmpW, bmpH := getBitmapSize(ii.hbmColor)
+	log.Printf("[cursor] colour cursor: hbmColor raw=%dx%d", bmpW, bmpH)
+
+	getSystemMetricsProc := user32.NewProc("GetSystemMetrics")
+	sysW, _, _ := getSystemMetricsProc.Call(13)
+	sysH, _, _ := getSystemMetricsProc.Call(14)
+	cursorW := int(int32(sysW))
+	cursorH := int(int32(sysH))
+
+	readRows := bmpH
+	if cursorH > 0 && bmpH == cursorH*2 {
+		readRows = cursorH
+		log.Printf("[cursor] colour cursor: doubled detected, reading %d rows", readRows)
+	}
+	imgW := bmpW
+	if cursorW > 0 && cursorW < imgW {
+		imgW = cursorW
 	}
 
-	return nil, windows.ERROR_NOT_FOUND
-}
-
-func dibToNRGBA(hbm windows.Handle) (*image.NRGBA, int, int, error) {
-	gdi32 := windows.NewLazyDLL("gdi32.dll")
-	getObjectProc := gdi32.NewProc("GetObjectW")
-
-	var bm _bitmap
-	r1, _, _ := getObjectProc.Call(uintptr(hbm), uintptr(unsafe.Sizeof(bm)), uintptr(unsafe.Pointer(&bm)))
-	if r1 == 0 {
-		return nil, 0, 0, windows.GetLastError()
-	}
-
-	w := int(bm.bmWidth)
-	h := int(bm.bmHeight)
-
-	// For 32-bit color cursors, bmHeight is typically 2× the image height
-	// (color bitmap stacked on top of mask). Detect and correct.
-	if bm.bmBitsPixel == 32 && h > 0 && h%2 == 0 {
-		// Check if the bottom half looks like a mask (only check when we have the bitmap)
-		// For safety we always divide by 2 for 32-bit cursor bitmaps
-		h = h / 2
-	}
-
-	// Get screen DC and create compatible DC
-	user32 := windows.NewLazyDLL("user32.dll")
-	getDCProc := user32.NewProc("GetDC")
-	hdc, _, _ := getDCProc.Call(0)
+	hdc, _, _ := user32.NewProc("GetDC").Call(0)
 	if hdc == 0 {
-		return nil, 0, 0, windows.ERROR_INVALID_HANDLE
+		return nil, windows.ERROR_INVALID_HANDLE
 	}
 	defer user32.NewProc("ReleaseDC").Call(0, hdc)
 
 	hdcMem, _, _ := gdi32.NewProc("CreateCompatibleDC").Call(hdc)
 	if hdcMem == 0 {
-		return nil, 0, 0, windows.ERROR_INVALID_HANDLE
+		return nil, windows.ERROR_INVALID_HANDLE
 	}
 	defer gdi32.NewProc("DeleteDC").Call(hdcMem)
 
-	oldBmp, _, _ := gdi32.NewProc("SelectObject").Call(hdcMem, uintptr(hbm))
+	oldBmp, _, _ := gdi32.NewProc("SelectObject").Call(hdcMem, uintptr(ii.hbmColor))
 	defer gdi32.NewProc("SelectObject").Call(hdcMem, oldBmp)
 
 	var bi _bitmapHeader
 	bi.biSize = uint32(unsafe.Sizeof(bi))
-	bi.biWidth = int32(w)
-	bi.biHeight = -int32(h) // negative = top-down DIB
+	bi.biWidth = int32(bmpW)
+	bi.biHeight = -int32(readRows)
 	bi.biPlanes = 1
 	bi.biBitCount = 32
-	bi.biCompression = 0 // BI_RGB
+	bi.biCompression = 0
 
-	buf := make([]byte, w*h*4)
+	buf := make([]byte, bmpW*readRows*4)
 	r1, _, _ = gdi32.NewProc("GetDIBits").Call(
-		hdcMem, uintptr(hbm),
-		0, uintptr(h),
+		hdcMem, uintptr(ii.hbmColor),
+		0, uintptr(readRows),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&bi)),
-		0, // DIB_RGB_COLORS
+		0,
 	)
 	if r1 == 0 {
-		return nil, 0, 0, windows.GetLastError()
+		log.Printf("[cursor] colour GetDIBits failed: %v", windows.GetLastError())
+		return nil, windows.GetLastError()
 	}
 
-	// Convert BGRA → NRGBA
-	img := image.NewNRGBA(image.Rect(0, 0, w, h))
-	for i := 0; i < w*h; i++ {
-		offset := i * 4
-		img.Pix[offset+0] = buf[offset+2] // R ← B
-		img.Pix[offset+1] = buf[offset+1] // G ← G
-		img.Pix[offset+2] = buf[offset+0] // B ← R
-		img.Pix[offset+3] = buf[offset+3] // A ← A
+	srcStride := bmpW * 4
+	nonZero := 0
+	for _, b := range buf {
+		if b != 0 {
+			nonZero++
+		}
+	}
+	log.Printf("[cursor] colour buffer nonZero=%d/%d (%.1f%%)", nonZero, len(buf),
+		float64(nonZero)/float64(len(buf))*100)
+
+	img := image.NewNRGBA(image.Rect(0, 0, imgW, readRows))
+	for y := 0; y < readRows; y++ {
+		srcRow := buf[y*srcStride : (y+1)*srcStride]
+		dstRow := img.Pix[y*img.Stride : (y+1)*img.Stride]
+		for x := 0; x < imgW; x++ {
+			off := x * 4
+			dstRow[off+0] = srcRow[off+2]
+			dstRow[off+1] = srcRow[off+1]
+			dstRow[off+2] = srcRow[off+0]
+			dstRow[off+3] = srcRow[off+3]
+		}
 	}
 
-	// Clean up: delete the temp buf to help GC
-	buf = nil
+	alphaZero, alphaFull := 0, 0
+	for i := 3; i < len(img.Pix); i += 4 {
+		switch img.Pix[i] {
+		case 0:
+			alphaZero++
+		case 255:
+			alphaFull++
+		}
+	}
+	log.Printf("[cursor] colour output %dx%d alpha_zero=%d alpha_255=%d total=%d",
+		imgW, readRows, alphaZero, alphaFull, imgW*readRows)
 
-	return img, w, h, nil
+	return encodeCursorPNG(img, imgW, readRows, hotspotX, hotspotY)
 }
 
-func maskToNRGBA(hbm windows.Handle) (*image.NRGBA, int, int, error) {
-	gdi32 := windows.NewLazyDLL("gdi32.dll")
-	getObjectProc := gdi32.NewProc("GetObjectW")
-
-	var bm _bitmap
-	r1, _, _ := getObjectProc.Call(uintptr(hbm), uintptr(unsafe.Sizeof(bm)), uintptr(unsafe.Pointer(&bm)))
-	if r1 == 0 {
-		return nil, 0, 0, windows.GetLastError()
+// getBitmapSize returns the width and height of a GDI bitmap.
+func getBitmapSize(hbm windows.Handle) (w, h int) {
+	if hbm == 0 {
+		return 0, 0
 	}
+	gdi32 := windows.NewLazyDLL("gdi32.dll")
+	var bm _bitmap
+	r1, _, _ := gdi32.NewProc("GetObjectW").Call(uintptr(hbm), uintptr(unsafe.Sizeof(bm)), uintptr(unsafe.Pointer(&bm)))
+	if r1 == 0 {
+		return 0, 0
+	}
+	return int(bm.bmWidth), int(bm.bmHeight)
+}
 
-	w := int(bm.bmWidth)
-	fullH := int(bm.bmHeight)
-	if fullH <= 0 {
+// decodeMaskCursor decodes a monochrome cursor from its AND/XOR mask bitmap.
+// The mask bitmap stores AND mask (top half) and XOR mask (bottom half) as 1 bpp.
+func decodeMaskCursor(hbmMask windows.Handle) (*image.NRGBA, int, int, error) {
+	gdi32 := windows.NewLazyDLL("gdi32.dll")
+	user32 := windows.NewLazyDLL("user32.dll")
+
+	bmpW, fullH := getBitmapSize(hbmMask)
+	if bmpW <= 0 || fullH <= 0 {
 		return nil, 0, 0, windows.ERROR_INVALID_DATA
 	}
-	h := fullH / 2 // mask is AND mask (top) + XOR mask (bottom)
+	realH := fullH / 2 // AND (top) + XOR (bottom) stacked
+	log.Printf("[cursor] decodeMaskCursor: mask=%dx%d real=%dx%d", bmpW, fullH, bmpW, realH)
 
-	user32 := windows.NewLazyDLL("user32.dll")
-	getDCProc := user32.NewProc("GetDC")
-	hdc, _, _ := getDCProc.Call(0)
+	hdc, _, _ := user32.NewProc("GetDC").Call(0)
 	if hdc == 0 {
 		return nil, 0, 0, windows.ERROR_INVALID_HANDLE
 	}
@@ -347,81 +378,90 @@ func maskToNRGBA(hbm windows.Handle) (*image.NRGBA, int, int, error) {
 	}
 	defer gdi32.NewProc("DeleteDC").Call(hdcMem)
 
-	oldBmp, _, _ := gdi32.NewProc("SelectObject").Call(hdcMem, uintptr(hbm))
+	oldBmp, _, _ := gdi32.NewProc("SelectObject").Call(hdcMem, uintptr(hbmMask))
 	defer gdi32.NewProc("SelectObject").Call(hdcMem, oldBmp)
 
-	// Get the full mask as a 1-bpp DIB (each row is DWORD-aligned)
 	var bi _bitmapHeader
 	bi.biSize = uint32(unsafe.Sizeof(bi))
-	bi.biWidth = int32(w)
+	bi.biWidth = int32(bmpW)
 	bi.biHeight = -int32(fullH)
 	bi.biPlanes = 1
 	bi.biBitCount = 1
 	bi.biCompression = 0
 
-	rowBytes := ((w + 31) / 32) * 4
+	rowBytes := ((bmpW + 31) / 32) * 4
 	buf := make([]byte, rowBytes*fullH)
-	r1, _, _ = gdi32.NewProc("GetDIBits").Call(
-		hdcMem, uintptr(hbm),
+	r1, _, _ := gdi32.NewProc("GetDIBits").Call(
+		hdcMem, uintptr(hbmMask),
 		0, uintptr(fullH),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&bi)),
 		0,
 	)
 	if r1 == 0 {
+		log.Printf("[cursor] decodeMaskCursor: GetDIBits failed: %v", windows.GetLastError())
 		return nil, 0, 0, windows.GetLastError()
 	}
 
-	// AND mask: first h rows; XOR mask: last h rows
-	img := image.NewNRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
+	opaqueCount, transpCount := 0, 0
+	img := image.NewNRGBA(image.Rect(0, 0, bmpW, realH))
+	for y := 0; y < realH; y++ {
 		andRow := buf[y*rowBytes : (y+1)*rowBytes]
-		xorRow := buf[(y+h)*rowBytes : (y+h+1)*rowBytes]
-		for x := 0; x < w; x++ {
+		xorRow := buf[(y+realH)*rowBytes : (y+realH+1)*rowBytes]
+		for x := 0; x < bmpW; x++ {
 			byteIdx := x / 8
 			bitIdx := 7 - (x % 8)
 			andBit := (andRow[byteIdx] >> bitIdx) & 1
 			xorBit := (xorRow[byteIdx] >> bitIdx) & 1
 
-			offset := (y*w + x) * 4
+			offset := (y*bmpW + x) * 4
 			if andBit == 0 && xorBit == 0 {
 				// opaque black
 				img.Pix[offset+0] = 0
 				img.Pix[offset+1] = 0
 				img.Pix[offset+2] = 0
 				img.Pix[offset+3] = 255
+				opaqueCount++
 			} else if andBit == 1 && xorBit == 0 {
 				// transparent
 				img.Pix[offset+0] = 0
 				img.Pix[offset+1] = 0
 				img.Pix[offset+2] = 0
 				img.Pix[offset+3] = 0
+				transpCount++
 			} else if andBit == 0 && xorBit == 1 {
 				// opaque white
 				img.Pix[offset+0] = 255
 				img.Pix[offset+1] = 255
 				img.Pix[offset+2] = 255
 				img.Pix[offset+3] = 255
+				opaqueCount++
 			} else {
-				// invert (andBit=1, xorBit=1) – treat as black
+				// invert 鈥?treat as black
 				img.Pix[offset+0] = 0
 				img.Pix[offset+1] = 0
 				img.Pix[offset+2] = 0
 				img.Pix[offset+3] = 255
+				opaqueCount++
 			}
 		}
 	}
+	log.Printf("[cursor] decodeMaskCursor: output %dx%d opaque=%d transp=%d total=%d",
+		bmpW, realH, opaqueCount, transpCount, bmpW*realH)
 
-	return img, w, h, nil
+	return img, bmpW, realH, nil
 }
 
 func encodeCursorPNG(img image.Image, w, h, hotspotX, hotspotY int) (*CursorInfo, error) {
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
+		log.Printf("[cursor] encodeCursorPNG: png.Encode failed: %v", err)
 		return nil, err
 	}
+	b64 := base64.StdEncoding.EncodeToString(buf.Bytes())
+	log.Printf("[cursor] encodeCursorPNG: pngRaw=%d base64=%d chars", buf.Len(), len(b64))
 	return &CursorInfo{
-		ImageData: base64.StdEncoding.EncodeToString(buf.Bytes()),
+		ImageData: b64,
 		Width:     w,
 		Height:    h,
 		HotspotX:  hotspotX,
@@ -430,35 +470,27 @@ func encodeCursorPNG(img image.Image, w, h, hotspotX, hotspotY int) (*CursorInfo
 }
 
 // ---- SendInput structs and helpers ------------------------------------------
-//
-// We replace the deprecated mouse_event / keybd_event / SetCursorPos with
-// SendInput so that synthesized input flows through the full input pipeline —
-// including DWM cursor rendering. This fixes the issue where SetCursorPos moved
-// the logical cursor (apps saw hover) but the visible cursor sprite did not
-// update (PowerToys crosshair / screen capture showed no movement).
 
 const (
 	_INPUT_MOUSE    = 0
 	_INPUT_KEYBOARD = 1
 )
 
-// Flags for MOUSEINPUT.dwFlags
 const (
-	_MOUSEEVENTF_MOVE       = 0x0001
-	_MOUSEEVENTF_LEFTDOWN   = 0x0002
-	_MOUSEEVENTF_LEFTUP     = 0x0004
-	_MOUSEEVENTF_RIGHTDOWN  = 0x0008
-	_MOUSEEVENTF_RIGHTUP    = 0x0010
-	_MOUSEEVENTF_MIDDLEDOWN = 0x0020
-	_MOUSEEVENTF_MIDDLEUP   = 0x0040
-	_MOUSEEVENTF_ABSOLUTE   = 0x8000
-	_MOUSEEVENTF_WHEEL      = 0x0800
-	_MOUSEEVENTF_HWHEEL     = 0x1000
+	_MOUSEEVENTF_MOVE        = 0x0001
+	_MOUSEEVENTF_LEFTDOWN    = 0x0002
+	_MOUSEEVENTF_LEFTUP      = 0x0004
+	_MOUSEEVENTF_RIGHTDOWN   = 0x0008
+	_MOUSEEVENTF_RIGHTUP     = 0x0010
+	_MOUSEEVENTF_MIDDLEDOWN  = 0x0020
+	_MOUSEEVENTF_MIDDLEUP    = 0x0040
+	_MOUSEEVENTF_ABSOLUTE    = 0x8000
+	_MOUSEEVENTF_WHEEL       = 0x0800
+	_MOUSEEVENTF_HWHEEL      = 0x1000
 	_MOUSEEVENTF_VIRTUALDESK = 0x4000
 	_WHEEL_DELTA             = 120
 )
 
-// Flags for KEYBDINPUT.dwFlags
 const (
 	_KEYEVENTF_KEYUP = 0x0002
 )
@@ -480,23 +512,15 @@ type _KEYBDINPUT struct {
 	DwExtraInfo uintptr
 }
 
-// sendMouseInput sends a single mouse input event via SendInput.
 func sendMouseInput(flags uint32, dx, dy int32, mouseData uint32) error {
 	user32 := windows.NewLazyDLL("user32.dll")
 	sendInputProc := user32.NewProc("SendInput")
 
-	// INPUT struct layout on x64:
-	//   offset 0: type (uint32, 4 bytes)
-	//   offset 4: padding (4 bytes for union alignment)
-	//   offset 8: union data (MOUSEINPUT = 32 bytes)
-	// total: 40 bytes
 	const inputSize = 40
 	var buf [inputSize]byte
 
-	// type = INPUT_MOUSE
 	*(*uint32)(unsafe.Pointer(&buf[0])) = _INPUT_MOUSE
 
-	// MOUSEINPUT at offset 8
 	mi := (*_MOUSEINPUT)(unsafe.Pointer(&buf[8]))
 	mi.Dx = dx
 	mi.Dy = dy
@@ -512,16 +536,10 @@ func sendMouseInput(flags uint32, dx, dy int32, mouseData uint32) error {
 	return nil
 }
 
-// sendKeybdInput sends a single keyboard input event via SendInput.
 func sendKeybdInput(vk uint16, flags uint32) error {
 	user32 := windows.NewLazyDLL("user32.dll")
 	sendInputProc := user32.NewProc("SendInput")
 
-	// INPUT struct on x64:
-	//   offset 0: type (uint32, 4 bytes)
-	//   offset 4: padding (4 bytes for union alignment)
-	//   offset 8: union data (size = max(MOUSEINPUT=32, KEYBDINPUT=24, HARDWAREINPUT=8) = 32)
-	// total: 40 bytes — sizeof(INPUT) is determined by the LARGEST union member, not the one in use
 	const inputSize = 40
 	var buf [inputSize]byte
 
@@ -541,11 +559,7 @@ func sendKeybdInput(vk uint16, flags uint32) error {
 	return nil
 }
 
-// normalizedAbsolute converts a pixel coordinate to the 0–65535 absolute range
-// required by SendInput with MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESKTOP.
 func normalizedAbsolute(pixel, screenDim int) int32 {
-	// The canonical formula: (pixel * 65536) / screenDim
-	// where 65536 represents the full normalized range [0, 65535]
 	return int32((pixel * 65536) / screenDim)
 }
 
@@ -560,7 +574,6 @@ func getKeyState() ([]int, error) {
 	var pressed []int
 	for vk := 1; vk <= 254; vk++ {
 		ret, _, _ := getAsyncKeyStateProc.Call(uintptr(vk))
-		// MSB (bit 15) set = key is currently down
 		if ret&0x8000 != 0 {
 			pressed = append(pressed, vk)
 		}
