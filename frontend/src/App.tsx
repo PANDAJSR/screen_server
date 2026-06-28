@@ -32,7 +32,7 @@ function keyCodeToName(code: number): string {
 }
 
 type ConnectionState = 'connecting' | 'open' | 'closed' | 'error';
-type CursorMode = 'client' | 'remote';
+type CursorMode = 'disabled' | 'remote' | 'client' | 'remote-render';
 
 interface CursorImagePayload {
   data: string;
@@ -196,10 +196,9 @@ export function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const startedRef = useRef(false);
-  const inputEnabledRef = useRef(false);
+  const inputEnabledRef = useRef(true);
   const inputLockedRef = useRef(false);
-  const cursorModeRef = useRef<CursorMode>('remote');
-  const mouseEnabledRef = useRef(true);
+  const cursorModeRef = useRef<CursorMode>('client');
   const [connectionKey, setConnectionKey] = useState(0);
   const [state, setState] = useState<ConnectionState>('connecting');
   const [clientId, setClientId] = useState<string>('');
@@ -207,17 +206,16 @@ export function App() {
   const [iceState, setIceState] = useState<RTCIceConnectionState>('new');
   const [videoStats, setVideoStats] = useState('等待中');
   const [clock, setClock] = useState(() => new Date());
-  const [inputEnabled, setInputEnabled] = useState(false);
+  const [inputEnabled, setInputEnabled] = useState(true);
   const [inputLocked, setInputLocked] = useState(false);
   const [cursorPos, setCursorPos] = useState({ x: 0, y: 0 });
   const [screenSize, setScreenSize] = useState({ width: 1920, height: 1080 });
   const [cursorImage, setCursorImage] = useState<CursorImagePayload | null>(null);
-  const [cursorMode, setCursorMode] = useState<CursorMode>('remote');
+  const [cursorMode, setCursorMode] = useState<CursorMode>('client');
   // Client cursor mode: local mouse position on screen (for overlay rendering)
   const [clientCursorScreenPos, setClientCursorScreenPos] = useState({ x: 0, y: 0 });
   const [statusOpen, setStatusOpen] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
-  const [mouseEnabled, setMouseEnabled] = useState(true);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
@@ -232,7 +230,6 @@ export function App() {
   const prevTimeRef = useRef<number | null>(null);
 
   cursorModeRef.current = cursorMode;
-  mouseEnabledRef.current = mouseEnabled;
 
   const setInputEnabledSync = (enabled: boolean) => {
     inputEnabledRef.current = enabled;
@@ -306,7 +303,7 @@ export function App() {
     const sendInput = (type: SignalMessage['type'], payload: unknown) => {
       if (!inputEnabledRef.current) return;
       if (type === 'input-mousemove' || type === 'input-mousemove-abs' || type === 'input-mousebtn' || type === 'input-scroll') {
-        if (!mouseEnabledRef.current) return;
+        if (cursorModeRef.current === 'disabled') return;
       }
       if (type === 'input-keydown' || type === 'input-keyup') {
         if (!keyboardEnabled) return;
@@ -317,7 +314,6 @@ export function App() {
     // Remote cursor mode: pointer lock → relative movement
     const handleMouseMoveRemote = (e: MouseEvent) => {
       if (cursorModeRef.current !== 'remote') return;
-      if (!mouseEnabledRef.current) return;
       if (!inputEnabledRef.current) return;
       if (document.pointerLockElement !== videoRef.current) return;
       sendInput('input-mousemove', { x: e.movementX, y: e.movementY });
@@ -326,7 +322,7 @@ export function App() {
     // Mobile / touch
     const handleTouchStart = (e: TouchEvent) => {
       if (!inputEnabledRef.current) return;
-      if (!mouseEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
       const remote = mapClientToRemote(t.clientX, t.clientY);
@@ -338,7 +334,7 @@ export function App() {
 
     const handleTouchMove = (e: TouchEvent) => {
       if (!inputEnabledRef.current) return;
-      if (!mouseEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
       const remote = mapClientToRemote(t.clientX, t.clientY);
@@ -349,13 +345,13 @@ export function App() {
 
     const handleTouchEnd = (e: TouchEvent) => {
       if (!inputEnabledRef.current) return;
-      if (!mouseEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
       sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
     };
 
     // Mouse buttons (shared between modes)
     const handleMouseDown = (e: MouseEvent) => {
-      if (!mouseEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       const btn = e.button;
       let button = 1;
@@ -366,7 +362,7 @@ export function App() {
     };
 
     const handleMouseUp = (e: MouseEvent) => {
-      if (!mouseEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       const btn = e.button;
       let button = 1;
@@ -377,7 +373,7 @@ export function App() {
     };
 
     const handleWheel = (e: WheelEvent) => {
-      if (!mouseEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       e.preventDefault();
       sendInput('input-scroll', { dx: e.deltaX, dy: e.deltaY });
@@ -541,7 +537,6 @@ export function App() {
 
     const handleDocumentClick = (e: MouseEvent) => {
       if (!inputEnabledRef.current) return;
-      if (!mouseEnabledRef.current) return;
       if (cursorModeRef.current !== 'remote') return;
       const video = videoRef.current;
       if (!video) return;
@@ -604,9 +599,9 @@ export function App() {
         videoRef.current.srcObject = null;
       }
     };
-  }, [room, connectionKey, mouseEnabled, keyboardEnabled]);
+  }, [room, connectionKey, keyboardEnabled]);
 
-  // ---- Client cursor mode: video mousemove → absolute position + cursor overlay ----
+  // ---- Client / remote-render cursor mode: video mousemove → absolute position + cursor overlay ----
 
   useEffect(() => {
     const video = videoRef.current;
@@ -615,12 +610,14 @@ export function App() {
     let lastTime = 0;
 
     const handler = (e: MouseEvent) => {
-      if (cursorModeRef.current !== 'client') return;
-      if (!mouseEnabledRef.current) return;
+      const mode = cursorModeRef.current;
+      if (mode !== 'client' && mode !== 'remote-render') return;
       if (!inputEnabledRef.current) return;
 
-      // Update cursor overlay position instantly (every event, no throttle)
-      setClientCursorScreenPos(mapClientToScreenPos(e.clientX, e.clientY));
+      // Update cursor overlay position instantly for client mode (zero latency)
+      if (mode === 'client') {
+        setClientCursorScreenPos(mapClientToScreenPos(e.clientX, e.clientY));
+      }
 
       // Throttle network sends to ~60fps
       const now = Date.now();
@@ -637,7 +634,7 @@ export function App() {
 
     video.addEventListener('mousemove', handler);
     return () => video.removeEventListener('mousemove', handler);
-  }, [cursorMode, mouseEnabled, inputEnabled]);
+  }, [cursorMode, inputEnabled]);
 
   // ---- Click outside to close popovers ----
 
@@ -681,9 +678,11 @@ export function App() {
 
   const getOverlayText = () => {
     if (!inputEnabled) return null;
+    if (cursorMode === 'disabled') return '输入已启用（鼠标已禁用）';
     if (cursorMode === 'remote') {
       return inputLocked ? '点击或按 ESC 释放' : '点击视频锁定鼠标';
     }
+    if (cursorMode === 'remote-render') return '输入已启用（光标在视频中渲染）';
     return '输入已启用（客户端光标模式）';
   };
 
@@ -728,21 +727,27 @@ export function App() {
         <div className="popover inputPopover" ref={inputPopoverRef}>
           <h3>输入映射</h3>
           <Toggle label="启用输入" checked={inputEnabled} onChange={setInputEnabledSync} />
-          <Toggle label="鼠标" checked={mouseEnabled} onChange={setMouseEnabled} />
-          <Toggle label="键盘" checked={keyboardEnabled} onChange={setKeyboardEnabled} />
-          <div className="cursorModeGroup">
-            <span className="cursorModeLabel">光标模式</span>
-            <label className="toggleRow">
-              <input type="radio" name="cursorMode" checked={cursorMode === 'remote'} onChange={() => setCursorMode('remote')} />
-              <span className="toggleTrack"><span className="toggleThumb" /></span>
-              <span className="toggleLabel">远程光标</span>
-            </label>
-            <label className="toggleRow">
-              <input type="radio" name="cursorMode" checked={cursorMode === 'client'} onChange={() => setCursorMode('client')} />
-              <span className="toggleTrack"><span className="toggleThumb" /></span>
-              <span className="toggleLabel">客户端光标</span>
-            </label>
+          <div className="selectRow">
+            <span className="selectLabel">鼠标</span>
+            <select
+              className="cursorModeSelect"
+              value={cursorMode}
+              onChange={(e) => {
+                const mode = e.target.value as CursorMode;
+                setCursorMode(mode);
+                const ws = wsRef.current;
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: 'input-mode', payload: { cursorMode: mode } }));
+                }
+              }}
+            >
+              <option value="disabled">禁用</option>
+              <option value="remote">远程光标</option>
+              <option value="client">客户端光标</option>
+              <option value="remote-render">远程渲染光标</option>
+            </select>
           </div>
+          <Toggle label="键盘" checked={keyboardEnabled} onChange={setKeyboardEnabled} />
           <div className="keyStateSection">
             <span className="keyStateLabel">远端按键</span>
             {remoteKeysPressed.length === 0 ? (
@@ -759,9 +764,13 @@ export function App() {
             </button>
           </div>
           <div className="inputHint">
-            {cursorMode === 'remote'
-              ? (inputLocked ? '点击或按 ESC 释放' : '点击视频锁定鼠标')
-              : '移动鼠标到视频上即可控制远程'}
+            {cursorMode === 'disabled'
+              ? '鼠标输入已禁用'
+              : cursorMode === 'remote'
+                ? (inputLocked ? '点击或按 ESC 释放' : '点击视频锁定鼠标')
+                : cursorMode === 'remote-render'
+                  ? '移动鼠标到视频上即可控制远程（光标在视频中渲染）'
+                  : '移动鼠标到视频上即可控制远程'}
           </div>
         </div>
       )}
@@ -773,7 +782,7 @@ export function App() {
           playsInline
           muted
           controls={false}
-          style={inputEnabled && cursorMode === 'client' ? { cursor: 'none' } : undefined}
+          style={inputEnabled && (cursorMode === 'client' || cursorMode === 'remote-render') ? { cursor: 'none' } : undefined}
         />
         {inputEnabled && overlayText && (
           <div className="inputOverlay"><span>{overlayText}</span></div>
@@ -786,6 +795,7 @@ export function App() {
         {inputEnabled && cursorMode === 'client' && (
           <CursorOverlay position={clientCursorScreenPos} cursorImage={cursorImage} />
         )}
+        {/* Remote-render mode: cursor is rendered in the video stream — no overlay needed */}
       </section>
     </main>
   );

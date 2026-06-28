@@ -30,6 +30,7 @@ type FFmpegConfig struct {
 	// restart, because FFmpeg stdin is not a live force-keyframe control API.
 	GOP         int
 	UseHardware bool
+	DrawMouse   bool // render cursor in captured video frames
 }
 
 func DefaultFFmpegConfig() FFmpegConfig {
@@ -223,12 +224,16 @@ func buildDarwinArgs(cfg FFmpegConfig) []string {
 	if cfg.UseHardware {
 		codec = "h264_videotoolbox"
 	}
+	captureCursor := "0"
+	if cfg.DrawMouse {
+		captureCursor = "1"
+	}
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
 		"-fflags", "nobuffer",
 		"-f", "avfoundation",
-		"-capture_cursor", "0",
+		"-capture_cursor", captureCursor,
 		"-capture_mouse_clicks", "0",
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
 		"-pixel_format", "bgr0",
@@ -252,7 +257,7 @@ func buildDarwinArgs(cfg FFmpegConfig) []string {
 			"-loglevel", "warning",
 			"-fflags", "nobuffer",
 			"-f", "avfoundation",
-			"-capture_cursor", "0",
+			"-capture_cursor", captureCursor,
 			"-capture_mouse_clicks", "0",
 			"-framerate", fmt.Sprintf("%d", cfg.FPS),
 			"-pixel_format", "bgr0",
@@ -277,12 +282,16 @@ func buildDarwinArgs(cfg FFmpegConfig) []string {
 }
 
 func buildX11Args(cfg FFmpegConfig) []string {
+	drawMouse := "0"
+	if cfg.DrawMouse {
+		drawMouse = "1"
+	}
 	return []string{
 		"-hide_banner",
 		"-loglevel", "warning",
 		"-fflags", "nobuffer",
 		"-f", "x11grab",
-		"-draw_mouse", "0",
+		"-draw_mouse", drawMouse,
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
 		"-i", cfg.Device,
 		"-an",
@@ -302,12 +311,16 @@ func buildX11Args(cfg FFmpegConfig) []string {
 }
 
 func buildWindowsArgs(cfg FFmpegConfig) []string {
+	drawMouse := "0"
+	if cfg.DrawMouse {
+		drawMouse = "1"
+	}
 	return []string{
 		"-hide_banner",
 		"-loglevel", "warning",
 		"-fflags", "nobuffer",
 		"-f", "gdigrab",
-		"-draw_mouse", "0",
+		"-draw_mouse", drawMouse,
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
 		"-i", "desktop",
 		"-an",

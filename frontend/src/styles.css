@@ -273,35 +273,36 @@ p {
   background-size: contain;
 }
 
-/* ---- Cursor mode radio group ---- */
+/* ---- Cursor mode select dropdown ---- */
 
-.cursorModeGroup {
+.selectRow {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding-top: 4px;
-  border-top: 1px solid #e2e8f0;
+  align-items: center;
+  gap: 10px;
 }
 
-.cursorModeLabel {
-  font-size: 12px;
-  color: #596579;
-  font-weight: 500;
+.selectLabel {
+  font-size: 14px;
+  flex-shrink: 0;
 }
 
-.cursorModeGroup .toggleRow input[type="radio"] {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
+.cursorModeSelect {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid #cfd7e3;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1d2430;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+  appearance: auto;
 }
 
-.cursorModeGroup .toggleRow input[type="radio"]:checked + .toggleTrack {
-  background: #1f9d55;
-}
-
-.cursorModeGroup .toggleRow input[type="radio"]:checked + .toggleTrack .toggleThumb {
-  transform: translateX(18px);
+.cursorModeSelect:focus {
+  border-color: #1f9d55;
+  box-shadow: 0 0 0 2px rgba(31, 157, 85, 0.2);
 }
 
 .meta {

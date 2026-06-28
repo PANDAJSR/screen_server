@@ -101,6 +101,37 @@ func (m *Manager) OnSignal(ctx context.Context, signal signaling.ServerSignal) {
 		if err := m.handleCandidate(signal); err != nil {
 			log.Printf("rtc candidate failed client=%s err=%v", signal.ClientID, err)
 		}
+	case signaling.MessageTypeInputMode:
+		m.handleInputMode(signal)
+	}
+}
+
+func (m *Manager) handleInputMode(signal signaling.ServerSignal) {
+	var payload struct {
+		CursorMode string `json:"cursorMode"`
+	}
+	if err := json.Unmarshal(signal.Message.Payload, &payload); err != nil {
+		log.Printf("input-mode parse error client=%s err=%v", signal.ClientID, err)
+		return
+	}
+
+	m.mu.Lock()
+	session := m.sessions[signal.ClientID]
+	m.mu.Unlock()
+
+	if session == nil {
+		return
+	}
+
+	cfg := m.captureCfg
+	cfg.DrawMouse = payload.CursorMode == "remote-render"
+	log.Printf("input-mode client=%s cursorMode=%s drawMouse=%v", signal.ClientID, payload.CursorMode, cfg.DrawMouse)
+
+	// Non-blocking send to trigger capture restart
+	select {
+	case session.restartCh <- cfg:
+	default:
+		log.Printf("restart already pending for client=%s", signal.ClientID)
 	}
 }
 
@@ -208,10 +239,11 @@ type Session struct {
 	track    *webrtc.TrackLocalStaticSample
 	sender   *webrtc.RTPSender
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	once   sync.Once
-	done   chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	once      sync.Once
+	done      chan struct{}
+	restartCh chan capture.FFmpegConfig
 }
 
 func (m *Manager) newSession(clientID, room string, send func(signaling.Message)) (*Session, error) {
@@ -242,15 +274,16 @@ func (m *Manager) newSession(clientID, room string, send func(signaling.Message)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &Session{
-		clientID: clientID,
-		room:     room,
-		send:     send,
-		pc:       pc,
-		track:    track,
-		sender:   sender,
-		ctx:      ctx,
-		cancel:   cancel,
-		done:     make(chan struct{}),
+		clientID:  clientID,
+		room:      room,
+		send:      send,
+		pc:        pc,
+		track:     track,
+		sender:    sender,
+		ctx:       ctx,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		restartCh: make(chan capture.FFmpegConfig, 1),
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -313,6 +346,30 @@ func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCap
 
 	reader := stream.Reader()
 	for {
+		// Check for restart requests (non-blocking)
+		select {
+		case newCfg := <-s.restartCh:
+			log.Printf("restarting capture for cursor mode change client=%s drawMouse=%v", s.clientID, newCfg.DrawMouse)
+			if err := stream.Stop(); err != nil {
+				log.Printf("stop capture for restart failed client=%s err=%v", s.clientID, err)
+			}
+			for len(frames) > 0 {
+				<-frames
+			}
+			restarted, err := capture.StartFFmpegCapture(s.ctx, newCfg)
+			if err != nil {
+				if s.ctx.Err() == nil {
+					log.Printf("restart capture failed client=%s err=%v", s.clientID, err)
+				}
+				return
+			}
+			stream = restarted
+			reader = stream.Reader()
+			cfg = newCfg
+			continue
+		default:
+		}
+
 		select {
 		case <-s.ctx.Done():
 			return
