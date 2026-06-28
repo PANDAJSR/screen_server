@@ -517,12 +517,12 @@ func sendKeybdInput(vk uint16, flags uint32) error {
 	user32 := windows.NewLazyDLL("user32.dll")
 	sendInputProc := user32.NewProc("SendInput")
 
-	// INPUT struct for keyboard:
+	// INPUT struct on x64:
 	//   offset 0: type (uint32, 4 bytes)
-	//   offset 4: padding (4 bytes)
-	//   offset 8: KEYBDINPUT (24 bytes)
-	// total: 32 bytes
-	const inputSize = 32
+	//   offset 4: padding (4 bytes for union alignment)
+	//   offset 8: union data (size = max(MOUSEINPUT=32, KEYBDINPUT=24, HARDWAREINPUT=8) = 32)
+	// total: 40 bytes — sizeof(INPUT) is determined by the LARGEST union member, not the one in use
+	const inputSize = 40
 	var buf [inputSize]byte
 
 	*(*uint32)(unsafe.Pointer(&buf[0])) = _INPUT_KEYBOARD
