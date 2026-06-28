@@ -397,6 +397,11 @@ export function App() {
       sendInput('input-keydown', { keyCode: e.keyCode });
     };
 
+    const handleContextMenu = (e: MouseEvent) => {
+      if (!inputEnabledRef.current) return;
+      e.preventDefault();
+    };
+
     const handleKeyUp = (e: KeyboardEvent) => {
       if (!keyboardEnabled) return;
       if (!inputEnabledRef.current) return;
@@ -539,6 +544,7 @@ export function App() {
     document.addEventListener('keydown', handleKeyDown);
     document.addEventListener('keyup', handleKeyUp);
     document.addEventListener('click', handleDocumentClick);
+    document.addEventListener('contextmenu', handleContextMenu);
     document.addEventListener('touchstart', handleTouchStart, { passive: false });
     document.addEventListener('touchmove', handleTouchMove, { passive: false });
     document.addEventListener('touchend', handleTouchEnd);
@@ -556,6 +562,7 @@ export function App() {
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('keyup', handleKeyUp);
       document.removeEventListener('click', handleDocumentClick);
+      document.removeEventListener('contextmenu', handleContextMenu);
       document.removeEventListener('touchstart', handleTouchStart);
       document.removeEventListener('touchmove', handleTouchMove);
       document.removeEventListener('touchend', handleTouchEnd);
