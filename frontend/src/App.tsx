@@ -346,17 +346,27 @@ export function App() {
 
       if (touchEnabledRef.current) {
         e.preventDefault();
-        const touches: TouchContact[] = [];
+        // Build a set of changed identifiers so we can tell new from existing.
+        const changedIds = new Set<number>();
         for (let i = 0; i < e.changedTouches.length; i++) {
-          const t = e.changedTouches[i];
+          changedIds.add(e.changedTouches[i].identifier);
+        }
+        const touches: TouchContact[] = [];
+        // Include ALL active touches so Windows sees the full contact set.
+        for (let i = 0; i < e.touches.length; i++) {
+          const t = e.touches[i];
           activeTouches.add(t.identifier);
           const remote = mapClientToRemote(t.clientX, t.clientY);
-          if (remote) {
-            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: 'start' });
+          if (!remote) continue;
+          if (changedIds.has(t.identifier)) {
+            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "start" });
+          } else {
+            // Existing contact — keep alive with a move update.
+            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
           }
         }
         if (touches.length > 0) {
-          sendInput('input-touch', { touches });
+          sendInput("input-touch", { touches });
         }
         return;
       }
@@ -377,16 +387,17 @@ export function App() {
 
       if (touchEnabledRef.current) {
         e.preventDefault();
+        // Include ALL active touches so Windows sees the full contact set.
         const touches: TouchContact[] = [];
-        for (let i = 0; i < e.changedTouches.length; i++) {
-          const t = e.changedTouches[i];
+        for (let i = 0; i < e.touches.length; i++) {
+          const t = e.touches[i];
           const remote = mapClientToRemote(t.clientX, t.clientY);
           if (remote) {
-            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: 'move' });
+            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
           }
         }
         if (touches.length > 0) {
-          sendInput('input-touch', { touches });
+          sendInput("input-touch", { touches });
         }
         return;
       }
@@ -406,22 +417,38 @@ export function App() {
 
       if (touchEnabledRef.current) {
         e.preventDefault(); // suppress browser-synthesized mouse events
+        // Build a set of ended identifiers; other fingers stay alive.
+        const endedIds = new Set<number>();
+        for (let i = 0; i < e.changedTouches.length; i++) {
+          endedIds.add(e.changedTouches[i].identifier);
+          activeTouches.delete(e.changedTouches[i].identifier);
+        }
         const touches: TouchContact[] = [];
+        // Include ALL active touches (changed + remaining).
+        for (let i = 0; i < e.touches.length; i++) {
+          const t = e.touches[i];
+          const remote = mapClientToRemote(t.clientX, t.clientY);
+          if (!remote) continue;
+          touches.push({
+            id: t.identifier,
+            x: remote.x,
+            y: remote.y,
+            phase: "move",
+          });
+        }
+        // Now send the ended touches with phase=end and their last position.
         for (let i = 0; i < e.changedTouches.length; i++) {
           const t = e.changedTouches[i];
-          activeTouches.delete(t.identifier);
-          // For "end" we accept any coordinate since the pointer is lifting;
-          // use last known position if clientX/Y is 0.
           const remote = mapClientToRemote(t.clientX, t.clientY);
           touches.push({
             id: t.identifier,
             x: remote ? remote.x : 0,
             y: remote ? remote.y : 0,
-            phase: 'end',
+            phase: "end",
           });
         }
         if (touches.length > 0) {
-          sendInput('input-touch', { touches });
+          sendInput("input-touch", { touches });
         }
         return;
       }
