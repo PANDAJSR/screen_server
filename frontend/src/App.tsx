@@ -551,7 +551,19 @@ export function App() {
       });
       pcRef.current = pc;
 
-      pc.addTransceiver('video', { direction: 'recvonly' });
+      const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+
+      // Minimise jitter buffer for LAN (Chrome 129+/Edge 129+).
+      // On LAN with near-zero packet loss we don't need the default 30-100ms buffer.
+      const setLowLatency = () => {
+        try {
+          const r = videoTransceiver.receiver;
+          if (r && 'playoutDelayHint' in r) {
+            (r as any).playoutDelayHint = 0.05;
+          }
+        } catch { /* unsupported browser */ }
+      };
+      setLowLatency();
 
       pc.ontrack = (event) => {
         const [stream] = event.streams;
@@ -561,6 +573,8 @@ export function App() {
           if (playResult && playResult.catch) {
             playResult.catch(() => undefined);
           }
+          // Some browsers only accept playoutDelayHint once tracks are flowing.
+          setTimeout(setLowLatency, 100);
         }
       };
 

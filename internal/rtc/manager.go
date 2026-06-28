@@ -23,8 +23,8 @@ import (
 const (
 	videoTrackID     = "screen"
 	videoStreamID    = "desktop"
-	videoFrameBuffer = 8
-	maxQueuedLatency = 90 * time.Millisecond
+	videoFrameBuffer = 1
+	maxQueuedLatency = 33 * time.Millisecond
 )
 
 type Manager struct {
@@ -422,7 +422,6 @@ func (s *Session) writeFrames(frames <-chan capture.EncodedFrame) {
 	written := 0
 	keyframes := 0
 	lastLog := time.Now()
-	var nextWrite time.Time
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -437,18 +436,6 @@ func (s *Session) writeFrames(frames <-chan capture.EncodedFrame) {
 				}
 				sentKeyframe = true
 			}
-			if !nextWrite.IsZero() {
-				delay := time.Until(nextWrite)
-				if delay > 0 {
-					timer := time.NewTimer(delay)
-					select {
-					case <-s.ctx.Done():
-						timer.Stop()
-						return
-					case <-timer.C:
-					}
-				}
-			}
 			if err := s.track.WriteSample(media.Sample{
 				Data:     frame.Data,
 				Duration: frame.Duration,
@@ -458,11 +445,6 @@ func (s *Session) writeFrames(frames <-chan capture.EncodedFrame) {
 					s.Close()
 				}
 				return
-			}
-			if nextWrite.IsZero() || time.Since(nextWrite) > frame.Duration {
-				nextWrite = time.Now().Add(frame.Duration)
-			} else {
-				nextWrite = nextWrite.Add(frame.Duration)
 			}
 			written++
 			if frame.IsKeyframe {
