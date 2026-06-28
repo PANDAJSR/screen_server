@@ -383,10 +383,12 @@ export function App() {
       sendInput('input-scroll', { dx: e.deltaX, dy: e.deltaY });
     };
 
+    // Track keys currently pressed so we can simulate repeat on the remote side.
+    const heldKeys = new Set<number>();
+
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!keyboardEnabled) return;
       if (!inputEnabledRef.current) return;
-      if (e.repeat) return;
       if (
         e.keyCode === 32 || e.keyCode === 33 || e.keyCode === 34 || e.keyCode === 35 ||
         e.keyCode === 36 || e.keyCode === 37 || e.keyCode === 38 || e.keyCode === 39 ||
@@ -394,6 +396,15 @@ export function App() {
       ) {
         e.preventDefault();
       }
+      if (e.repeat) {
+        // Browser auto-repeat: simulate a fresh keystroke on the remote side.
+        // Windows SendInput does not generate typematic auto-repeat for injected
+        // input, so we must send a key-up + key-down pair for each repeat event.
+        sendInput('input-keyup', { keyCode: e.keyCode });
+        sendInput('input-keydown', { keyCode: e.keyCode });
+        return;
+      }
+      heldKeys.add(e.keyCode);
       sendInput('input-keydown', { keyCode: e.keyCode });
     };
 
@@ -403,6 +414,7 @@ export function App() {
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      heldKeys.delete(e.keyCode);
       if (!keyboardEnabled) return;
       if (!inputEnabledRef.current) return;
       sendInput('input-keyup', { keyCode: e.keyCode });
@@ -540,6 +552,14 @@ export function App() {
     document.addEventListener('mousemove', handleMouseMoveRemote);
     document.addEventListener('mousedown', handleMouseDown);
     document.addEventListener('mouseup', handleMouseUp);
+    const handleBlur = () => {
+      for (const keyCode of heldKeys) {
+        sendInput('input-keyup', { keyCode });
+      }
+      heldKeys.clear();
+    };
+    window.addEventListener('blur', handleBlur);
+
     document.addEventListener('wheel', handleWheel, { passive: false });
     document.addEventListener('keydown', handleKeyDown);
     document.addEventListener('keyup', handleKeyUp);
@@ -559,6 +579,11 @@ export function App() {
       document.removeEventListener('mousedown', handleMouseDown);
       document.removeEventListener('mouseup', handleMouseUp);
       document.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('blur', handleBlur);
+      for (const keyCode of heldKeys) {
+        sendInput('input-keyup', { keyCode });
+      }
+      heldKeys.clear();
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('keyup', handleKeyUp);
       document.removeEventListener('click', handleDocumentClick);
