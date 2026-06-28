@@ -269,6 +269,16 @@ func (h *Hub) handleInputMessage(msg Message) bool {
 			log.Printf("input release-all error: %v", err)
 		}
 
+	case MessageTypeInputTouch:
+		var ev input.TouchEvent
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
+			log.Printf("input touch parse error: %v", err)
+			return true
+		}
+		if err := h.inputCtrl.InjectTouch(ev.Touches); err != nil {
+			log.Printf("input touch error: %v", err)
+		}
+
 	default:
 		return false
 	}

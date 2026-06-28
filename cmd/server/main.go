@@ -2,8 +2,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"screen_server/internal/rtc"
@@ -13,7 +17,28 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	staticDir := flag.String("static", "./frontend/dist", "directory for built frontend assets")
+	logDir := flag.String("logdir", "./logs", "directory for log files")
 	flag.Parse()
+
+	// Ensure log directory exists.
+	if err := os.MkdirAll(*logDir, 0755); err != nil {
+		log.Fatalf("create log dir: %v", err)
+	}
+
+	// Open timestamped log file and tee output to both file and stderr.
+	logName := filepath.Join(*logDir, time.Now().Format("2006-01-02_150405")+".log")
+	logFile, err := os.Create(logName)
+	if err != nil {
+		log.Fatalf("create log file: %v", err)
+	}
+	defer logFile.Close()
+
+	multi := io.MultiWriter(os.Stderr, logFile)
+	log.SetOutput(multi)
+	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+	log.SetPrefix("")
+
+	fmt.Fprintf(os.Stderr, "logging to %s\n", logName)
 
 	rtcManager, err := rtc.NewManager()
 	if err != nil {

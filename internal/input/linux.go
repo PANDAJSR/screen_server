@@ -46,6 +46,10 @@ func (c *linuxController) ReleaseAllKeys() error {
 	return fmt.Errorf("not implemented")
 }
 
+func (c *linuxController) InjectTouch(contacts []TouchContact) error {
+	return fmt.Errorf("touch injection not implemented on linux")
+}
+
 func (c *linuxController) Close() error {
 	return nil
 }

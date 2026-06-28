@@ -11,10 +11,25 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type windowsController struct{}
+type windowsController struct {
+	touchReady   bool
+	touchDevice  uintptr // HSYNTHETICPOINTERDEVICE
+	touchActive  map[uint32]contactState
+	touchFrameID uint32
+}
+
+type contactState struct {
+	x int32
+	y int32
+}
 
 func newWindowsController() (Controller, error) {
-	return &windowsController{}, nil
+	wc := &windowsController{}
+	if err := wc.initTouchInjection(); err != nil {
+		log.Printf("touch injection not available: %v", err)
+		// Non-fatal: mouse/keyboard still work.
+	}
+	return wc, nil
 }
 
 func (c *windowsController) MoveMouse(x, y int) error {
@@ -90,6 +105,11 @@ func (c *windowsController) ReleaseAllKeys() error {
 }
 
 func (c *windowsController) Close() error {
+	if c.touchDevice != 0 {
+		user32 := windows.NewLazyDLL("user32.dll")
+		user32.NewProc("DestroySyntheticPointerDevice").Call(uintptr(c.touchDevice))
+		c.touchDevice = 0
+	}
 	return nil
 }
 
@@ -136,6 +156,108 @@ func (c *windowsController) GetScreenSize() (width, height int, err error) {
 
 func (c *windowsController) GetCursorInfo() (*CursorInfo, error) {
 	return getCursorInfo()
+}
+
+func (c *windowsController) InjectTouch(contacts []TouchContact) error {
+	if !c.touchReady {
+		return nil
+	}
+	if len(contacts) == 0 {
+		return nil
+	}
+
+	elemSize := int(unsafe.Sizeof(_POINTER_TYPE_INFO{}))
+	c.touchFrameID++
+	frameID := c.touchFrameID
+
+	buf := make([]byte, elemSize*len(contacts))
+	idx := 0
+
+	for _, ct := range contacts {
+		flags := touchPhaseToFlags(ct.Phase)
+		if flags == 0 {
+			continue
+		}
+
+		id := uint32(ct.ID)
+		x := int32(ct.X)
+		y := int32(ct.Y)
+
+		// END events may arrive with (0,0) — use last tracked position.
+		if ct.Phase == TouchPhaseEnd && x == 0 && y == 0 {
+			if tracked, ok := c.touchActive[id]; ok {
+				x = tracked.x
+				y = tracked.y
+			}
+		}
+
+		// Track state.
+		if ct.Phase == TouchPhaseStart || ct.Phase == TouchPhaseMove {
+			c.touchActive[id] = contactState{x: x, y: y}
+		} else if ct.Phase == TouchPhaseEnd {
+			delete(c.touchActive, id)
+		}
+
+		// Cast buffer element to the Go struct and populate it directly.
+		ptr := (*_POINTER_TYPE_INFO)(unsafe.Pointer(&buf[idx*elemSize]))
+		ptr.Type = _PT_TOUCH
+		ptr.TouchInfo.PointerInfo.PointerType = int32(_PT_TOUCH)
+		ptr.TouchInfo.PointerInfo.PointerId = id
+		ptr.TouchInfo.PointerInfo.FrameId = frameID
+		ptr.TouchInfo.PointerInfo.PointerFlags = flags
+		ptr.TouchInfo.PointerInfo.PtPixelLocation.X = x
+		ptr.TouchInfo.PointerInfo.PtPixelLocation.Y = y
+		ptr.TouchInfo.PointerInfo.PtPixelLocationRaw.X = x
+		ptr.TouchInfo.PointerInfo.PtPixelLocationRaw.Y = y
+		ptr.TouchInfo.TouchFlags = 0
+		ptr.TouchInfo.TouchMask = _TOUCH_MASK_CONTACTAREA | _TOUCH_MASK_ORIENTATION | _TOUCH_MASK_PRESSURE
+		ptr.TouchInfo.RcContact.Left = x - 4
+		ptr.TouchInfo.RcContact.Top = y - 4
+		ptr.TouchInfo.RcContact.Right = x + 4
+		ptr.TouchInfo.RcContact.Bottom = y + 4
+		ptr.TouchInfo.RcContactRaw.Left = x - 4
+		ptr.TouchInfo.RcContactRaw.Top = y - 4
+		ptr.TouchInfo.RcContactRaw.Right = x + 4
+		ptr.TouchInfo.RcContactRaw.Bottom = y + 4
+		ptr.TouchInfo.Orientation = 0
+		ptr.TouchInfo.Pressure = 1024
+
+		log.Printf("[touch] contact id=%d phase=%s flags=0x%x pos=(%d,%d) frame=%d", ct.ID, ct.Phase, flags, x, y, frameID)
+		idx++
+	}
+
+	if idx == 0 {
+		return nil
+	}
+
+	log.Printf("[touch] batch n=%d frame=%d → InjectSyntheticPointerInput", idx, frameID)
+
+	user32 := windows.NewLazyDLL("user32.dll")
+	proc := user32.NewProc("InjectSyntheticPointerInput")
+	r1, _, err := proc.Call(
+		uintptr(c.touchDevice),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(idx),
+	)
+	if r1 == 0 {
+		log.Printf("[touch] InjectSyntheticPointerInput failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+func touchPhaseToFlags(phase TouchPhase) uint32 {
+	switch phase {
+	case TouchPhaseStart:
+		return _POINTER_FLAG_DOWN | _POINTER_FLAG_INRANGE | _POINTER_FLAG_INCONTACT
+	case TouchPhaseMove:
+		return _POINTER_FLAG_UPDATE | _POINTER_FLAG_INRANGE | _POINTER_FLAG_INCONTACT
+	case TouchPhaseEnd:
+		// UP alone = end the contact completely (no hovering state).
+		return _POINTER_FLAG_UP
+	default:
+		return 0
+	}
 }
 
 // ---- Win32 structs and low-level helpers ------------------------------------
@@ -579,4 +701,137 @@ func getKeyState() ([]int, error) {
 		}
 	}
 	return pressed, nil
+}
+
+// ---- Touch injection (InjectSyntheticPointerInput) ----------------------------
+
+const (
+	// POINTER_INPUT_TYPE
+	_PT_POINTER   = 1
+	_PT_TOUCH     = 2
+	_PT_PEN       = 3
+	_PT_MOUSE     = 4
+	_PT_TOUCHPAD  = 5
+
+	// POINTER_FEEDBACK_MODE
+	_POINTER_FEEDBACK_DEFAULT  = 1
+	_POINTER_FEEDBACK_INDIRECT = 2
+	_POINTER_FEEDBACK_NONE     = 3
+
+	// POINTER_FLAGS
+	_POINTER_FLAG_NONE           = 0x00000000
+	_POINTER_FLAG_INRANGE        = 0x00000002
+	_POINTER_FLAG_INCONTACT      = 0x00000004
+	_POINTER_FLAG_FIRSTBUTTON    = 0x00000010
+	_POINTER_FLAG_SECONDBUTTON   = 0x00000020
+	_POINTER_FLAG_THIRDBUTTON    = 0x00000040
+	_POINTER_FLAG_FOURTHBUTTON   = 0x00000080
+	_POINTER_FLAG_FIFTHBUTTON    = 0x00000100
+	_POINTER_FLAG_PRIMARY        = 0x00002000
+	_POINTER_FLAG_CONFIDENCE     = 0x00004000
+	_POINTER_FLAG_CANCELED       = 0x00008000
+	_POINTER_FLAG_DOWN           = 0x00010000
+	_POINTER_FLAG_UPDATE         = 0x00020000
+	_POINTER_FLAG_UP             = 0x00040000
+	_POINTER_FLAG_WHEEL          = 0x00080000
+	_POINTER_FLAG_HWHEEL         = 0x00100000
+	_POINTER_FLAG_CAPTURECHANGED = 0x00200000
+	_POINTER_FLAG_HASTRANSFORM   = 0x00400000
+
+	// TOUCH_FLAGS
+	_TOUCH_FLAG_NONE = 0x00000000
+
+	// TOUCH_MASK
+	_TOUCH_MASK_NONE        = 0x00000000
+	_TOUCH_MASK_CONTACTAREA = 0x00000001
+	_TOUCH_MASK_ORIENTATION = 0x00000002
+	_TOUCH_MASK_PRESSURE    = 0x00000004
+
+	// POINTER_BUTTON_CHANGE_TYPE
+	_POINTER_CHANGE_NONE       = 0
+	_POINTER_CHANGE_FIRSTBUTTON_DOWN  = 1
+	_POINTER_CHANGE_FIRSTBUTTON_UP    = 2
+	_POINTER_CHANGE_SECONDBUTTON_DOWN = 3
+	_POINTER_CHANGE_SECONDBUTTON_UP   = 4
+	_POINTER_CHANGE_THIRDBUTTON_DOWN  = 5
+	_POINTER_CHANGE_THIRDBUTTON_UP    = 6
+	_POINTER_CHANGE_FOURTHBUTTON_DOWN = 7
+	_POINTER_CHANGE_FOURTHBUTTON_UP   = 8
+	_POINTER_CHANGE_FIFTHBUTTON_DOWN  = 9
+	_POINTER_CHANGE_FIFTHBUTTON_UP    = 10
+
+	_MAX_TOUCH_COUNT = 10
+)
+
+type _POINT struct {
+	X int32
+	Y int32
+}
+
+type _RECT struct {
+	Left   int32
+	Top    int32
+	Right  int32
+	Bottom int32
+}
+
+type _POINTER_INFO struct {
+	PointerType          int32
+	PointerId            uint32
+	FrameId              uint32
+	PointerFlags         uint32
+	SourceDevice         uintptr
+	HwndTarget           uintptr
+	PtPixelLocation      _POINT
+	PtHimetricLocation   _POINT
+	PtPixelLocationRaw   _POINT
+	PtHimetricLocationRaw _POINT
+	DwTime               uint32
+	HistoryCount         uint32
+	InputData            int32
+	DwKeyStates          uint32
+	PerformanceCount     uint64
+	ButtonChangeType     int32
+}
+
+type _POINTER_TOUCH_INFO struct {
+	PointerInfo   _POINTER_INFO
+	TouchFlags    uint32
+	TouchMask     uint32
+	RcContact     _RECT
+	RcContactRaw  _RECT
+	Orientation   uint32
+	Pressure      uint32
+}
+
+type _POINTER_TYPE_INFO struct {
+	Type      int32
+	_pad      uint32 // explicit padding to align the union
+	TouchInfo _POINTER_TOUCH_INFO
+}
+
+// initTouchInjection creates a synthetic touch device.
+func (c *windowsController) initTouchInjection() error {
+	c.touchActive = make(map[uint32]contactState)
+
+	user32 := windows.NewLazyDLL("user32.dll")
+	proc := user32.NewProc("CreateSyntheticPointerDevice")
+	if err := proc.Find(); err != nil {
+		log.Printf("[touch] CreateSyntheticPointerDevice not found: %v", err)
+		return err
+	}
+
+	r1, _, err := proc.Call(
+		uintptr(_PT_TOUCH),
+		uintptr(_MAX_TOUCH_COUNT),
+		uintptr(_POINTER_FEEDBACK_DEFAULT),
+	)
+	if r1 == 0 {
+		log.Printf("[touch] CreateSyntheticPointerDevice failed: %v", err)
+		return err
+	}
+	c.touchDevice = r1
+	c.touchReady = true
+	log.Printf("[touch] touch device created (handle=0x%x)", r1)
+	return nil
 }

@@ -42,6 +42,13 @@ interface CursorImagePayload {
   hotspotY: number;
 }
 
+interface TouchContact {
+  id: number;
+  x: number;
+  y: number;
+  phase: 'start' | 'move' | 'end';
+}
+
 // ---- CursorOverlay — renders the OS cursor image at a screen position ----
 
 function CursorOverlay({
@@ -199,6 +206,7 @@ export function App() {
   const inputEnabledRef = useRef(true);
   const inputLockedRef = useRef(false);
   const cursorModeRef = useRef<CursorMode>('client');
+  const touchEnabledRef = useRef(true);
   const [connectionKey, setConnectionKey] = useState(0);
   const [state, setState] = useState<ConnectionState>('connecting');
   const [clientId, setClientId] = useState<string>('');
@@ -217,6 +225,7 @@ export function App() {
   const [statusOpen, setStatusOpen] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
+  const [touchEnabled, setTouchEnabled] = useState(true);
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
   const [remoteKeysPressed, setRemoteKeysPressed] = useState<number[]>([]);
@@ -230,6 +239,7 @@ export function App() {
   const prevTimeRef = useRef<number | null>(null);
 
   cursorModeRef.current = cursorMode;
+  touchEnabledRef.current = touchEnabled;
 
   const setInputEnabledSync = (enabled: boolean) => {
     inputEnabledRef.current = enabled;
@@ -308,6 +318,10 @@ export function App() {
       if (type === 'input-keydown' || type === 'input-keyup') {
         if (!keyboardEnabled) return;
       }
+      if (type === 'input-touch') {
+        if (!touchEnabledRef.current) return;
+        if (cursorModeRef.current === 'disabled') return;
+      }
       sendSignal({ type, payload });
     };
 
@@ -319,10 +333,35 @@ export function App() {
       sendInput('input-mousemove', { x: e.movementX, y: e.movementY });
     };
 
-    // Mobile / touch
+    // Mobile / touch — dual mode:
+    //   touchEnabled ON  → native multi-touch via input-touch messages
+    //   touchEnabled OFF → legacy single-finger mouse emulation
+
+    // Track which fingers are currently active (for cancel cleanup).
+    const activeTouches = new Set<number>();
+
     const handleTouchStart = (e: TouchEvent) => {
       if (!inputEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
+
+      if (touchEnabledRef.current) {
+        e.preventDefault();
+        const touches: TouchContact[] = [];
+        for (let i = 0; i < e.changedTouches.length; i++) {
+          const t = e.changedTouches[i];
+          activeTouches.add(t.identifier);
+          const remote = mapClientToRemote(t.clientX, t.clientY);
+          if (remote) {
+            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: 'start' });
+          }
+        }
+        if (touches.length > 0) {
+          sendInput('input-touch', { touches });
+        }
+        return;
+      }
+
+      // Legacy: single finger → absolute mouse + left button
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
       const remote = mapClientToRemote(t.clientX, t.clientY);
@@ -335,6 +374,24 @@ export function App() {
     const handleTouchMove = (e: TouchEvent) => {
       if (!inputEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
+
+      if (touchEnabledRef.current) {
+        e.preventDefault();
+        const touches: TouchContact[] = [];
+        for (let i = 0; i < e.changedTouches.length; i++) {
+          const t = e.changedTouches[i];
+          const remote = mapClientToRemote(t.clientX, t.clientY);
+          if (remote) {
+            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: 'move' });
+          }
+        }
+        if (touches.length > 0) {
+          sendInput('input-touch', { touches });
+        }
+        return;
+      }
+
+      // Legacy: single finger → absolute mouse move
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
       const remote = mapClientToRemote(t.clientX, t.clientY);
@@ -346,11 +403,52 @@ export function App() {
     const handleTouchEnd = (e: TouchEvent) => {
       if (!inputEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
+
+      if (touchEnabledRef.current) {
+        e.preventDefault(); // suppress browser-synthesized mouse events
+        const touches: TouchContact[] = [];
+        for (let i = 0; i < e.changedTouches.length; i++) {
+          const t = e.changedTouches[i];
+          activeTouches.delete(t.identifier);
+          // For "end" we accept any coordinate since the pointer is lifting;
+          // use last known position if clientX/Y is 0.
+          const remote = mapClientToRemote(t.clientX, t.clientY);
+          touches.push({
+            id: t.identifier,
+            x: remote ? remote.x : 0,
+            y: remote ? remote.y : 0,
+            phase: 'end',
+          });
+        }
+        if (touches.length > 0) {
+          sendInput('input-touch', { touches });
+        }
+        return;
+      }
+
+      // Legacy: release left mouse button
       sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
     };
 
+    const handleTouchCancel = (e: TouchEvent) => {
+      if (!touchEnabledRef.current) return;
+      // Cancel all active touches — send "end" for each.
+      const touches: TouchContact[] = [];
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        activeTouches.delete(t.identifier);
+        touches.push({ id: t.identifier, x: 0, y: 0, phase: 'end' });
+      }
+      if (touches.length > 0) {
+        sendInput('input-touch', { touches });
+      }
+    };
+
     // Mouse buttons (shared between modes)
+    // When touch is enabled, skip mouse events — they're synthesised by the browser
+    // from touch interactions and we handle those via input-touch instead.
     const handleMouseDown = (e: MouseEvent) => {
+      if (touchEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       const btn = e.button;
@@ -362,6 +460,7 @@ export function App() {
     };
 
     const handleMouseUp = (e: MouseEvent) => {
+      if (touchEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       const btn = e.button;
@@ -431,7 +530,10 @@ export function App() {
         const [stream] = event.streams;
         if (videoRef.current && stream) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(() => undefined);
+          const playResult = videoRef.current.play();
+          if (playResult && playResult.catch) {
+            playResult.catch(() => undefined);
+          }
         }
       };
 
@@ -567,6 +669,7 @@ export function App() {
     document.addEventListener('touchstart', handleTouchStart, { passive: false });
     document.addEventListener('touchmove', handleTouchMove, { passive: false });
     document.addEventListener('touchend', handleTouchEnd);
+    document.addEventListener('touchcancel', handleTouchCancel);
 
     return () => {
       if (pingTimer !== undefined) window.clearInterval(pingTimer);
@@ -590,6 +693,7 @@ export function App() {
       document.removeEventListener('touchstart', handleTouchStart);
       document.removeEventListener('touchmove', handleTouchMove);
       document.removeEventListener('touchend', handleTouchEnd);
+      document.removeEventListener('touchcancel', handleTouchCancel);
       pcRef.current?.close();
       pcRef.current = null;
       ws.close();
@@ -599,7 +703,7 @@ export function App() {
         videoRef.current.srcObject = null;
       }
     };
-  }, [room, connectionKey, keyboardEnabled]);
+  }, [room, connectionKey, keyboardEnabled, touchEnabled]);
 
   // ---- Client / remote-render cursor mode: video mousemove → absolute position + cursor overlay ----
 
@@ -748,6 +852,7 @@ export function App() {
             </select>
           </div>
           <Toggle label="键盘" checked={keyboardEnabled} onChange={setKeyboardEnabled} />
+          <Toggle label="触摸" checked={touchEnabled} onChange={(v) => { setTouchEnabled(v); }} />
           <div className="keyStateSection">
             <span className="keyStateLabel">远端按键</span>
             {remoteKeysPressed.length === 0 ? (

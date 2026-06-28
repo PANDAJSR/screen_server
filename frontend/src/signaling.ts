@@ -18,6 +18,7 @@ export type SignalType =
   | 'input-keyup'
   | 'input-key-state'
   | 'input-release-all'
+  | 'input-touch'
   | 'cursor-pos'
   | 'cursor-image'
   | 'screen-size';

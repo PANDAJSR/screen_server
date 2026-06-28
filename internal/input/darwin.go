@@ -46,6 +46,10 @@ func (c *darwinController) ReleaseAllKeys() error {
 	return fmt.Errorf("not implemented")
 }
 
+func (c *darwinController) InjectTouch(contacts []TouchContact) error {
+	return fmt.Errorf("touch injection not implemented on darwin")
+}
+
 func (c *darwinController) Close() error {
 	return nil
 }

@@ -30,6 +30,7 @@ const (
 	MessageTypeScreenSize         = "screen-size"          // screen dimensions from server
 	MessageTypeInputKeyState      = "input-key-state"      // server → client: currently pressed keys
 	MessageTypeInputReleaseAll    = "input-release-all"    // client → server: release all keys
+	MessageTypeInputTouch         = "input-touch"          // client → server: multi-touch batch
 )
 
 // Message is the only JSON envelope used by the signaling channel.

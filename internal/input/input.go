@@ -37,6 +37,30 @@ type KeyEvent struct {
 	Pressed bool
 }
 
+// TouchPhase describes the lifecycle stage of a touch contact.
+type TouchPhase string
+
+const (
+	TouchPhaseStart TouchPhase = "start" // finger down
+	TouchPhaseMove  TouchPhase = "move"  // finger moved
+	TouchPhaseEnd   TouchPhase = "end"   // finger up
+)
+
+// TouchContact represents a single finger/contact point.
+type TouchContact struct {
+	ID    int        `json:"id"`
+	X     int        `json:"x"`
+	Y     int        `json:"y"`
+	Phase TouchPhase `json:"phase"`
+}
+
+// TouchEvent carries a batch of touch contacts from the client.
+// All contacts in a batch are injected atomically to preserve
+// multi-touch gesture integrity (e.g. pinch-zoom, rotation).
+type TouchEvent struct {
+	Touches []TouchContact `json:"touches"`
+}
+
 // CursorInfo holds the current OS cursor image and hotspot.
 type CursorInfo struct {
 	ImageData string // base64-encoded PNG
@@ -59,6 +83,7 @@ type Controller interface {
 	SetCursorPos(x, y int) error
 	GetKeyState() ([]int, error)
 	ReleaseAllKeys() error
+	InjectTouch(contacts []TouchContact) error
 	Close() error
 }
 
