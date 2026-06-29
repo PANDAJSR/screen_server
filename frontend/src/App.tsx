@@ -230,6 +230,14 @@ export function App() {
   const [fps, setFps] = useState<number | null>(null);
   const [remoteKeysPressed, setRemoteKeysPressed] = useState<number[]>([]);
 
+  // ---- Screen latency detection (blue→red flash test) ----
+  type LatencyState = 'idle' | 'waiting-blue' | 'waiting-red' | 'done';
+  const [latencyState, setLatencyState] = useState<LatencyState>('idle');
+  const [videoLatencyMs, setVideoLatencyMs] = useState<number | null>(null);
+  const [latencyError, setLatencyError] = useState<string | null>(null);
+  const latencyRafRef = useRef<number | null>(null);
+  const latencyTimeoutRef = useRef<number | null>(null);
+
   const statusButtonRef = useRef<HTMLButtonElement | null>(null);
   const inputButtonRef = useRef<HTMLButtonElement | null>(null);
   const statusPopoverRef = useRef<HTMLDivElement | null>(null);
@@ -741,6 +749,8 @@ export function App() {
       if (pingTimer !== undefined) window.clearInterval(pingTimer);
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (clockTimer !== undefined) window.clearInterval(clockTimer);
+      if (latencyRafRef.current != null) cancelAnimationFrame(latencyRafRef.current);
+      if (latencyTimeoutRef.current != null) clearTimeout(latencyTimeoutRef.current);
       if (document.pointerLockElement === videoRef.current) document.exitPointerLock();
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
       document.removeEventListener('mousemove', handleMouseMoveRemote);
@@ -846,6 +856,119 @@ export function App() {
     ws.send(JSON.stringify({ type: 'input-release-all' }));
   }, []);
 
+  // ---- Screen latency detection ----
+  // The server shows a topmost blue window; we watch the decoded video's center
+  // pixel. When blue appears we start a timer and tell the server to flip to
+  // red; when red appears we stop the timer. The interval spans
+  // signaling-up + server-draw + video-down — real interactive latency.
+
+  const stopLatencySampling = useCallback(() => {
+    if (latencyRafRef.current != null) {
+      cancelAnimationFrame(latencyRafRef.current);
+      latencyRafRef.current = null;
+    }
+    if (latencyTimeoutRef.current != null) {
+      clearTimeout(latencyTimeoutRef.current);
+      latencyTimeoutRef.current = null;
+    }
+  }, []);
+
+  const sendLatency = (type: 'latency-start' | 'latency-blue' | 'latency-red') => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type }));
+    }
+  };
+
+  const runLatencyTest = () => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0) {
+      setLatencyError('视频未就绪');
+      return;
+    }
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setLatencyError('未连接');
+      return;
+    }
+
+    stopLatencySampling();
+    setVideoLatencyMs(null);
+    setLatencyError(null);
+    setLatencyState('waiting-blue');
+    sendLatency('latency-start');
+
+    const sampleSize = 16;
+    const canvas = document.createElement('canvas');
+    canvas.width = sampleSize;
+    canvas.height = sampleSize;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) {
+      setLatencyError('无法创建画布');
+      setLatencyState('idle');
+      return;
+    }
+
+    let phase: 'waiting-blue' | 'waiting-red' = 'waiting-blue';
+    let tBlue = 0;
+
+    const classify = (r: number, g: number, b: number): 'blue' | 'red' | null => {
+      if (b > 150 && r < 100 && g < 100) return 'blue';
+      if (r > 150 && b < 100 && g < 100) return 'red';
+      return null;
+    };
+
+    const sample = () => {
+      const v = videoRef.current;
+      if (!v || v.videoWidth === 0) {
+        latencyRafRef.current = requestAnimationFrame(sample);
+        return;
+      }
+      const sx = Math.max(0, Math.floor(v.videoWidth / 2 - sampleSize / 2));
+      const sy = Math.max(0, Math.floor(v.videoHeight / 2 - sampleSize / 2));
+      try {
+        ctx.drawImage(v, sx, sy, sampleSize, sampleSize, 0, 0, sampleSize, sampleSize);
+      } catch {
+        latencyRafRef.current = requestAnimationFrame(sample);
+        return;
+      }
+      const data = ctx.getImageData(0, 0, sampleSize, sampleSize).data;
+      let r = 0, g = 0, b = 0;
+      const n = sampleSize * sampleSize;
+      for (let i = 0; i < data.length; i += 4) {
+        r += data[i];
+        g += data[i + 1];
+        b += data[i + 2];
+      }
+      const c = classify(r / n, g / n, b / n);
+
+      if (phase === 'waiting-blue' && c === 'blue') {
+        tBlue = performance.now();
+        phase = 'waiting-red';
+        setLatencyState('waiting-red');
+        sendLatency('latency-blue');
+      } else if (phase === 'waiting-red' && c === 'red') {
+        const ms = performance.now() - tBlue;
+        stopLatencySampling();
+        setVideoLatencyMs(ms);
+        setLatencyState('done');
+        sendLatency('latency-red');
+        return;
+      }
+      latencyRafRef.current = requestAnimationFrame(sample);
+    };
+
+    latencyRafRef.current = requestAnimationFrame(sample);
+
+    // Abort + close the server window if nothing is detected in time.
+    latencyTimeoutRef.current = window.setTimeout(() => {
+      stopLatencySampling();
+      setLatencyState('idle');
+      setLatencyError('检测超时（未观察到颜色变化）');
+      sendLatency('latency-red');
+    }, 10000);
+  };
+
   const getOverlayText = () => {
     if (!inputEnabled) return null;
     if (cursorMode === 'disabled') return '输入已启用（鼠标已禁用）';
@@ -890,6 +1013,21 @@ export function App() {
               <dd>{clock.toLocaleTimeString()}.{clock.getMilliseconds().toString().padStart(3, '0')}</dd>
             </div>
           </dl>
+          <div className="latencyTestSection">
+            <button
+              className="latencyTestBtn"
+              onClick={runLatencyTest}
+              disabled={latencyState === 'waiting-blue' || latencyState === 'waiting-red'}
+            >
+              {latencyState === 'waiting-blue' || latencyState === 'waiting-red' ? '检测中…' : '画面延迟检测'}
+            </button>
+            {videoLatencyMs !== null && (
+              <span className="latencyTestResult">画面延迟 {videoLatencyMs.toFixed(1)} 毫秒</span>
+            )}
+            {latencyState === 'waiting-blue' && <span className="latencyTestHint">等待蓝色…</span>}
+            {latencyState === 'waiting-red' && <span className="latencyTestHint">等待红色…</span>}
+            {latencyError && <span className="latencyTestError">{latencyError}</span>}
+          </div>
         </div>
       )}
 

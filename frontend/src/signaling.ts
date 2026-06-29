@@ -21,7 +21,10 @@ export type SignalType =
   | 'input-touch'
   | 'cursor-pos'
   | 'cursor-image'
-  | 'screen-size';
+  | 'screen-size'
+  | 'latency-start'
+  | 'latency-blue'
+  | 'latency-red';
 
 export interface SignalMessage<TPayload = unknown> {
   type: SignalType;

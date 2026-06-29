@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"screen_server/internal/input"
+	"screen_server/internal/latency"
 
 	"github.com/gorilla/websocket"
 )
@@ -29,6 +30,7 @@ type Hub struct {
 	rooms      map[string]map[*Client]bool
 	handler    ServerHandler
 	inputCtrl  input.Controller
+	latencyCtl latency.Controller
 }
 
 type inboundMessage struct {
@@ -42,6 +44,11 @@ func NewHub(handler ServerHandler) (*Hub, error) {
 		log.Printf("input controller not available: %v", err)
 	}
 
+	latencyCtl, err := latency.NewController()
+	if err != nil {
+		log.Printf("latency controller not available: %v", err)
+	}
+
 	hub := &Hub{
 		register:   make(chan *Client, 16),
 		unregister: make(chan *Client, 16),
@@ -49,6 +56,7 @@ func NewHub(handler ServerHandler) (*Hub, error) {
 		rooms:      make(map[string]map[*Client]bool),
 		handler:    handler,
 		inputCtrl:  inputCtrl,
+		latencyCtl: latencyCtl,
 	}
 
 	if inputCtrl != nil {
@@ -165,6 +173,9 @@ func (h *Hub) Run() {
 				go h.handler.OnSignal(context.Background(), signal)
 				continue
 			}
+			if h.handleLatencyMessage(msg) {
+				continue
+			}
 			if h.handleInputMessage(msg) {
 				continue
 			}
@@ -175,6 +186,36 @@ func (h *Hub) Run() {
 			h.broadcast(inbound.client.room, inbound.client, msg)
 		}
 	}
+}
+
+func (h *Hub) handleLatencyMessage(msg Message) bool {
+	switch msg.Type {
+	case MessageTypeLatencyStart:
+		if h.latencyCtl == nil {
+			log.Printf("latency-start ignored: controller unavailable")
+			return true
+		}
+		if err := h.latencyCtl.ShowBlue(); err != nil {
+			log.Printf("latency-start error: %v", err)
+		}
+	case MessageTypeLatencyBlue:
+		if h.latencyCtl == nil {
+			return true
+		}
+		if err := h.latencyCtl.ShowRed(); err != nil {
+			log.Printf("latency-blue error: %v", err)
+		}
+	case MessageTypeLatencyRed:
+		if h.latencyCtl == nil {
+			return true
+		}
+		if err := h.latencyCtl.Close(); err != nil {
+			log.Printf("latency-red error: %v", err)
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 func (h *Hub) handleInputMessage(msg Message) bool {

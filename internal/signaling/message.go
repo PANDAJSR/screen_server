@@ -31,6 +31,12 @@ const (
 	MessageTypeInputKeyState      = "input-key-state"      // server → client: currently pressed keys
 	MessageTypeInputReleaseAll    = "input-release-all"    // client → server: release all keys
 	MessageTypeInputTouch         = "input-touch"          // client → server: multi-touch batch
+
+	// Latency detection message types (client → server). The client drives the
+	// timer; the server only toggles a topmost colored window on screen.
+	MessageTypeLatencyStart = "latency-start" // begin test: server shows blue window
+	MessageTypeLatencyBlue  = "latency-blue"  // client saw blue: server flips to red
+	MessageTypeLatencyRed   = "latency-red"   // client saw red: server closes window
 )
 
 // Message is the only JSON envelope used by the signaling channel.
