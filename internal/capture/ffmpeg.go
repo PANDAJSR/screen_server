@@ -31,6 +31,11 @@ type FFmpegConfig struct {
 	GOP         int
 	UseHardware bool
 	DrawMouse   bool // render cursor in captured video frames
+	// Encoder selects the Windows H.264 encoder: "nvenc", "qsv", "amf", or
+	// "x264" (software fallback). Empty/unknown ⇒ libx264. Hardware encoders
+	// offload the encode stage from the CPU and cut end-to-end latency without
+	// touching bitrate, FPS, or resolution.
+	Encoder string
 }
 
 func DefaultFFmpegConfig() FFmpegConfig {
@@ -315,7 +320,11 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	if cfg.DrawMouse {
 		drawMouse = "1"
 	}
-	return []string{
+	// Input + output options shared by every encoder. Hardware encoders differ
+	// only in the codec/preset/RC block; bitrate, GOP, no B-frames, baseline
+	// profile and AUD insertion stay identical so quality and the Annex-B frame
+	// framing are unchanged versus the software path.
+	common := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
 		"-fflags", "nobuffer",
@@ -325,21 +334,103 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 		"-i", "desktop",
 		"-an",
 		"-vf", "format=yuv420p",
-		"-c:v", "libx264",
-		"-threads", "2",
-		"-preset", "ultrafast",
-		"-tune", "zerolatency",
+		"-avioflags", "direct",
+	}
+	tail := []string{
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
 		"-bufsize", cfg.BufferSize,
 		"-g", fmt.Sprintf("%d", cfg.GOP),
 		"-bf", "0",
 		"-profile:v", "baseline",
-		"-avioflags", "direct",
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-f", "h264",
 		"pipe:1",
 	}
+
+	var enc []string
+	switch cfg.Encoder {
+	case "nvenc":
+		// p1 = fastest preset; ll = low-latency tune; cbr + delay 0 keep the
+		// encode pipeline depth at zero (no reordering/lookahead buffering).
+		enc = []string{
+			"-c:v", "h264_nvenc",
+			"-preset", "p1",
+			"-tune", "ll",
+			"-rc", "cbr",
+			"-delay", "0",
+		}
+	case "qsv":
+		// look_ahead 0 disables Intel's lookahead buffer.
+		enc = []string{
+			"-c:v", "h264_qsv",
+			"-preset", "veryfast",
+			"-look_ahead", "0",
+		}
+	case "amf":
+		// ultralowlatency usage is AMD's minimal-pipeline mode.
+		enc = []string{
+			"-c:v", "h264_amf",
+			"-usage", "ultralowlatency",
+			"-rc", "cbr",
+		}
+	default: // "x264" / "" — software fallback
+		enc = []string{
+			"-c:v", "libx264",
+			"-threads", "2",
+			"-preset", "ultrafast",
+			"-tune", "zerolatency",
+		}
+	}
+
+	return append(append(common, enc...), tail...)
+}
+
+// ProbeEncoder picks a hardware H.264 encoder when one actually works on this
+// machine, falling back to software x264. Override with SCREEN_SERVER_ENCODER
+// (values: auto, nvenc, qsv, amf, x264). Probing once at startup avoids a
+// per-session ffmpeg invocation; the test encode validates the encoder and GPU.
+func ProbeEncoder(binary string) string {
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("SCREEN_SERVER_ENCODER")))
+	switch env {
+	case "x264":
+		return "x264"
+	case "nvenc", "qsv", "amf":
+		if encoderWorks(binary, env) {
+			return env
+		}
+		log.Printf("requested encoder %s unavailable; probing others", env)
+	case "", "auto":
+		// fall through to auto probe
+	default:
+		log.Printf("unknown SCREEN_SERVER_ENCODER=%q; probing", env)
+	}
+	for _, e := range []string{"nvenc", "qsv", "amf"} {
+		if encoderWorks(binary, e) {
+			return e
+		}
+	}
+	return "x264"
+}
+
+func encoderWorks(binary, enc string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=black:s=64x64:r=5",
+		"-frames:v", "1",
+		"-c:v", "h264_"+enc,
+		"-f", "null", "-",
+	)
+	if err := cmd.Run(); err != nil {
+		log.Printf("encoder probe %s failed: %v", enc, err)
+		return false
+	}
+	return true
 }
 
 func logFFmpeg(stderr io.Reader) {

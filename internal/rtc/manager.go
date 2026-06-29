@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -73,6 +74,13 @@ func NewManager() (*Manager, error) {
 			captureCfg.FPS = parsed
 			captureCfg.GOP = max(1, parsed/4)
 		}
+	}
+
+	// Hardware encoding on Windows cuts the encode-stage latency and CPU load
+	// without changing bitrate/quality/FPS. Probed once at startup.
+	if runtime.GOOS == "windows" {
+		captureCfg.Encoder = capture.ProbeEncoder(captureCfg.Binary)
+		log.Printf("selected video encoder: %s", captureCfg.Encoder)
 	}
 
 	return &Manager{

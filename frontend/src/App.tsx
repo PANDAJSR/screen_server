@@ -574,12 +574,18 @@ export function App() {
       const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
 
       // Minimise jitter buffer for LAN (Chrome 129+/Edge 129+).
-      // On LAN with near-zero packet loss we don't need the default 30-100ms buffer.
+      // On LAN with near-zero packet loss we ask for the minimum playout delay
+      // (0) so frames display as soon as decoded instead of buffering ~50ms.
       const setLowLatency = () => {
         try {
           const r = videoTransceiver.receiver;
+          // setJitterBufferMinimumDelay is the modern API (replaces
+          // playoutDelayHint, which Chrome deprecates). Call both for coverage.
+          if (r && 'setJitterBufferMinimumDelay' in r) {
+            (r as any).setJitterBufferMinimumDelay(0);
+          }
           if (r && 'playoutDelayHint' in r) {
-            (r as any).playoutDelayHint = 0.05;
+            (r as any).playoutDelayHint = 0;
           }
         } catch { /* unsupported browser */ }
       };
