@@ -278,16 +278,24 @@ export function App() {
     return { left: contentLeft, top: contentTop, width: contentWidth, height: contentHeight };
   }
 
-  /** Map a clientX/clientY (viewport pixels) to remote screen coordinates. Returns null if outside content area. */
+  /** Map a clientX/clientY (viewport pixels) to remote screen coordinates. Returns null if outside content area.
+   *  The output coordinate space is the VIDEO's intrinsic resolution (what gdigrab
+   *  captured and what SetCursorPos normalizes against) — NOT the separately
+   *  reported screenSize, which can disagree (e.g. 1080 vs actual 1200). */
   function mapClientToRemote(clientX: number, clientY: number): { x: number; y: number } | null {
+    const video = videoRef.current;
+    if (!video) return null;
+    // Authoritative remote dimensions = the decoded video frame size.
+    const remoteW = video.videoWidth || screenSize.width;
+    const remoteH = video.videoHeight || screenSize.height;
     const cr = getContentRect();
     if (!cr) return null;
     if (clientX < cr.left || clientX > cr.left + cr.width || clientY < cr.top || clientY > cr.top + cr.height) {
       return null;
     }
     return {
-      x: Math.round(((clientX - cr.left) / cr.width) * screenSize.width),
-      y: Math.round(((clientY - cr.top) / cr.height) * screenSize.height),
+      x: Math.round(((clientX - cr.left) / cr.width) * remoteW),
+      y: Math.round(((clientY - cr.top) / cr.height) * remoteH),
     };
   }
 
@@ -472,10 +480,9 @@ export function App() {
     };
 
     // Mouse buttons (shared between modes)
-    // When touch is enabled, skip mouse events — they're synthesised by the browser
-    // from touch interactions and we handle those via input-touch instead.
+    // Physical mouse clicks are always handled here regardless of touch mode.
+    // Touch synthesised mouse events are suppressed by preventDefault in touch handlers.
     const handleMouseDown = (e: MouseEvent) => {
-      if (touchEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       const btn = e.button;
@@ -483,11 +490,14 @@ export function App() {
       if (btn === 0) button = 1;
       else if (btn === 2) button = 2;
       else if (btn === 1) button = 4;
-      sendInput('input-mousebtn', { button, pressed: true, x: e.clientX, y: e.clientY });
+      // Map through the same coordinate pipeline used by mousemove so clicks land
+      // exactly where the cursor was placed.
+      const remote = mapClientToRemote(e.clientX, e.clientY);
+      if (!remote) return;
+      sendInput('input-mousebtn', { button, pressed: true, x: remote.x, y: remote.y });
     };
 
     const handleMouseUp = (e: MouseEvent) => {
-      if (touchEnabledRef.current) return;
       if (cursorModeRef.current === 'disabled') return;
       if (!inputEnabledRef.current) return;
       const btn = e.button;
@@ -495,7 +505,9 @@ export function App() {
       if (btn === 0) button = 1;
       else if (btn === 2) button = 2;
       else if (btn === 1) button = 4;
-      sendInput('input-mousebtn', { button, pressed: false, x: e.clientX, y: e.clientY });
+      const remote = mapClientToRemote(e.clientX, e.clientY);
+      if (!remote) return;
+      sendInput('input-mousebtn', { button, pressed: false, x: remote.x, y: remote.y });
     };
 
     const handleWheel = (e: WheelEvent) => {
@@ -568,7 +580,20 @@ export function App() {
       pc.ontrack = (event) => {
         const [stream] = event.streams;
         if (videoRef.current && stream) {
+          // Use video metadata as authoritative screen size — it IS the
+          // captured desktop, so its intrinsic resolution trumps the server-
+          // reported GetSystemMetrics value (which can be wrong under DPI
+          // virtualization or multi-monitor setups).
+          const onMeta = () => {
+            const v = videoRef.current;
+            if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+              setScreenSize({ width: v.videoWidth, height: v.videoHeight });
+            }
+          };
+          videoRef.current.addEventListener('loadedmetadata', onMeta, { once: true });
           videoRef.current.srcObject = stream;
+          // If metadata already loaded (e.g. reconnection), apply immediately.
+          if (videoRef.current.videoWidth > 0) onMeta();
           const playResult = videoRef.current.play();
           if (playResult && playResult.catch) {
             playResult.catch(() => undefined);

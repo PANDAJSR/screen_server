@@ -130,6 +130,36 @@ func (c *windowsController) GetCursorPos() (x, y int, err error) {
 	return int(pt.X) - int(int32(originX)), int(pt.Y) - int(int32(originY)), nil
 }
 
+func (c *windowsController) GetScreenSize() (width, height int, err error) {
+	user32 := windows.NewLazyDLL("user32.dll")
+	gdi32 := windows.NewLazyDLL("gdi32.dll")
+
+	// Get the desktop DC to query real device dimensions.
+	// GetSystemMetrics(SM_CXVIRTUALSCREEN) can return incorrect values
+	// under DPI virtualization or on some Windows IoT / LTSC editions.
+	hdc, _, _ := user32.NewProc("GetDC").Call(0)
+	if hdc == 0 {
+		// Fall back to GetSystemMetrics.
+		getSM := user32.NewProc("GetSystemMetrics")
+		w, _, _ := getSM.Call(78) // SM_CXVIRTUALSCREEN
+		h, _, _ := getSM.Call(79) // SM_CYVIRTUALSCREEN
+		width = int(int32(w))
+		height = int(int32(h))
+	} else {
+		defer user32.NewProc("ReleaseDC").Call(0, hdc)
+		getDeviceCaps := gdi32.NewProc("GetDeviceCaps")
+		// HORZRES=8, VERTRES=10 — width/height in pixels of the desktop.
+		w, _, _ := getDeviceCaps.Call(hdc, 8)
+		h, _, _ := getDeviceCaps.Call(hdc, 10)
+		width = int(int32(w))
+		height = int(int32(h))
+	}
+	if width == 0 || height == 0 {
+		return 0, 0, windows.GetLastError()
+	}
+	return width, height, nil
+}
+
 func (c *windowsController) SetCursorPos(x, y int) error {
 	w, h, err := c.GetScreenSize()
 	if err != nil {
@@ -139,19 +169,6 @@ func (c *windowsController) SetCursorPos(x, y int) error {
 	dy := normalizedAbsolute(y, h)
 	flags := uint32(_MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_VIRTUALDESK)
 	return sendMouseInput(flags, dx, dy, 0)
-}
-
-func (c *windowsController) GetScreenSize() (width, height int, err error) {
-	user32 := windows.NewLazyDLL("user32.dll")
-	getSystemMetricsProc := user32.NewProc("GetSystemMetrics")
-	w, _, _ := getSystemMetricsProc.Call(78)
-	h, _, _ := getSystemMetricsProc.Call(79)
-	width = int(int32(w))
-	height = int(int32(h))
-	if width == 0 || height == 0 {
-		return 0, 0, windows.GetLastError()
-	}
-	return width, height, nil
 }
 
 func (c *windowsController) GetCursorInfo() (*CursorInfo, error) {
