@@ -328,15 +328,22 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 		"-hide_banner",
 		"-loglevel", "info", // info exposes speed= lines for latency diagnosis
 		"-fflags", "nobuffer",
-		"-rtbufsize", "1M", // cap real-time capture buffer (default 3041280≈3M)
+		"-thread_queue_size", "512", // give gdigrab capture thread headroom
 		"-f", "gdigrab",
-		"-draw_mouse", drawMouse,
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
+		"-draw_mouse", drawMouse,
+	}
+	// Allow overriding gdigrab capture area via env for displays where auto-
+	// detection introduces latency (e.g. SCREEN_SERVER_CAPTURE_SIZE=1920x1200).
+	if size := os.Getenv("SCREEN_SERVER_CAPTURE_SIZE"); size != "" {
+		common = append(common, "-video_size", size)
+	}
+	common = append(common,
 		"-i", "desktop",
 		"-an",
 		"-vf", "format=yuv420p",
 		"-avioflags", "direct",
-	}
+	)
 	tail := []string{
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
