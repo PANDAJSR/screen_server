@@ -42,11 +42,11 @@ func DefaultFFmpegConfig() FFmpegConfig {
 	return FFmpegConfig{
 		Binary:      "ffmpeg",
 		Device:      defaultScreenDevice(),
-		FPS:         60,
+		FPS:         30,
 		Bitrate:     "8M",
 		MaxRate:     "12M",
 		BufferSize:  "1M",
-		GOP:         15,
+		GOP:         7, // keyframe every ~233ms at 30fps
 		UseHardware: true,
 	}
 }
@@ -341,7 +341,6 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	common = append(common,
 		"-i", "desktop",
 		"-an",
-		"-vf", "format=yuv420p",
 		"-avioflags", "direct",
 	)
 	tail := []string{
@@ -359,9 +358,9 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	var enc []string
 	switch cfg.Encoder {
 	case "nvenc":
-		// p1 = fastest preset; ll = low-latency tune; cbr + delay 0 keep the
-		// encode pipeline depth at zero (no reordering/lookahead buffering).
+		// NV12+hwupload_cuda → one GPU upload, nvenc reads from VRAM directly.
 		enc = []string{
+			"-vf", "format=nv12,hwupload_cuda",
 			"-c:v", "h264_nvenc",
 			"-preset", "p1",
 			"-tune", "ll",
@@ -369,21 +368,22 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 			"-delay", "0",
 		}
 	case "qsv":
-		// look_ahead 0 disables Intel's lookahead buffer.
 		enc = []string{
+			"-vf", "format=nv12,hwupload=extra_hw_frames=16",
 			"-c:v", "h264_qsv",
 			"-preset", "veryfast",
 			"-look_ahead", "0",
 		}
 	case "amf":
-		// ultralowlatency usage is AMD's minimal-pipeline mode.
 		enc = []string{
+			"-vf", "format=nv12",
 			"-c:v", "h264_amf",
 			"-usage", "ultralowlatency",
 			"-rc", "cbr",
 		}
 	default: // "x264" / "" — software fallback
 		enc = []string{
+			"-vf", "format=yuv420p",
 			"-c:v", "libx264",
 			"-threads", "2",
 			"-preset", "ultrafast",
