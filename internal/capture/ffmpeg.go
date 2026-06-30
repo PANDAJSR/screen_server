@@ -326,7 +326,7 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	// framing are unchanged versus the software path.
 	common := []string{
 		"-hide_banner",
-		"-loglevel", "warning",
+		"-loglevel", "info", // info exposes speed= lines for latency diagnosis
 		"-fflags", "nobuffer",
 		"-f", "gdigrab",
 		"-draw_mouse", drawMouse,
@@ -437,7 +437,12 @@ func logFFmpeg(stderr io.Reader) {
 	scanner := bufio.NewScanner(stderr)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "speed=") {
+			log.Printf("[ffmpeg-progress] %s", line)
+		} else {
 			log.Printf("ffmpeg: %s", line)
 		}
 	}

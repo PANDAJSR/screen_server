@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createSignalingSocket, type SignalMessage } from './signaling';
+import { logger, setLogWs } from './logger';
 
 // ---- Key code → readable name mapping ----
 
@@ -614,6 +615,29 @@ export function App() {
           }
           // Some browsers only accept playoutDelayHint once tracks are flowing.
           setTimeout(setLowLatency, 100);
+
+          // Per-frame display timing via requestVideoFrameCallback (Chrome/Edge).
+          // Logs mediaTime, presentation delay, and frame gap every 60 frames.
+          if ('requestVideoFrameCallback' in (videoRef.current as any)) {
+            let fc = 0;
+            let lastMedia: number | null = null;
+            const onFrame = (_now: DOMHighResTimeStamp, md: any) => {
+              fc++;
+              if (fc % 60 === 0) {
+                const gap = lastMedia !== null ? md.mediaTime - lastMedia : 0;
+                const delay = md.presentationTime - md.expectedDisplayTime;
+                logger.info('frame-presented', {
+                  mediaTime: Number(md.mediaTime.toFixed(3)),
+                  gapMs: Number((gap * 1000).toFixed(2)),
+                  delayMs: Number((delay * 1000).toFixed(2)),
+                  presented: md.presentedFrames,
+                });
+              }
+              lastMedia = md.mediaTime;
+              (videoRef.current as any)?.requestVideoFrameCallback(onFrame);
+            };
+            (videoRef.current as any).requestVideoFrameCallback(onFrame);
+          }
         }
       };
 
@@ -642,6 +666,7 @@ export function App() {
 
     ws.onopen = () => {
       setState('open');
+      setLogWs(ws);
       sendSignal({ type: 'hello', payload: { userAgent: navigator.userAgent } });
 
       pingTimer = window.setInterval(() => {
@@ -696,9 +721,7 @@ export function App() {
         setCursorPos({ x: pos.x, y: pos.y });
       } else if (message.type === 'cursor-image' && message.payload) {
         const ci = message.payload as CursorImagePayload;
-        console.log('[cursor-client] received:', ci.width + 'x' + ci.height,
-          'hotspot=(' + ci.hotspotX + ',' + ci.hotspotY + ')',
-          'dataLen=' + ci.data.length);
+        logger.info('cursor-image received', { w: ci.width, h: ci.height, hx: ci.hotspotX, hy: ci.hotspotY, len: ci.data.length });
         setCursorImage(ci);
       } else if (message.type === 'screen-size' && message.payload) {
         const size = message.payload as { width: number; height: number };
@@ -708,8 +731,8 @@ export function App() {
       }
     };
 
-    ws.onerror = () => setState('error');
-    ws.onclose = () => setState('closed');
+    ws.onerror = () => { setState('error'); setLogWs(null); };
+    ws.onclose = () => { setState('closed'); setLogWs(null); };
 
     const handlePointerLockChange = () => {
       const locked = document.pointerLockElement === videoRef.current;
@@ -778,6 +801,7 @@ export function App() {
       document.removeEventListener('touchcancel', handleTouchCancel);
       pcRef.current?.close();
       pcRef.current = null;
+      setLogWs(null);
       ws.close();
       wsRef.current = null;
       startedRef.current = false;

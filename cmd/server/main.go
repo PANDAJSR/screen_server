@@ -35,7 +35,7 @@ func main() {
 
 	multi := io.MultiWriter(os.Stderr, logFile)
 	log.SetOutput(multi)
-	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lmsgprefix)
 	log.SetPrefix("")
 
 	fmt.Fprintf(os.Stderr, "logging to %s\n", logName)

@@ -173,6 +173,9 @@ func (h *Hub) Run() {
 				go h.handler.OnSignal(context.Background(), signal)
 				continue
 			}
+			if h.handleClientLog(msg) {
+				continue
+			}
 			if h.handleLatencyMessage(msg) {
 				continue
 			}
@@ -186,6 +189,29 @@ func (h *Hub) Run() {
 			h.broadcast(inbound.client.room, inbound.client, msg)
 		}
 	}
+}
+
+func (h *Hub) handleClientLog(msg Message) bool {
+	if msg.Type != MessageTypeLog {
+		return false
+	}
+	var payload struct {
+		Level string  `json:"level"`
+		Msg   string  `json:"msg"`
+		TS    float64 `json:"ts"`
+		Data  any     `json:"data,omitempty"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Printf("[frontend] bad log: %v", err)
+		return true
+	}
+	dataStr := ""
+	if payload.Data != nil {
+		dataBytes, _ := json.Marshal(payload.Data)
+		dataStr = string(dataBytes)
+	}
+	log.Printf("[frontend] [%s] %s clk=%.3f %s", payload.Level, payload.Msg, payload.TS, dataStr)
+	return true
 }
 
 func (h *Hub) handleLatencyMessage(msg Message) bool {

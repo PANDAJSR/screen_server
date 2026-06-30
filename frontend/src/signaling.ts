@@ -24,7 +24,8 @@ export type SignalType =
   | 'screen-size'
   | 'latency-start'
   | 'latency-blue'
-  | 'latency-red';
+  | 'latency-red'
+  | 'log';
 
 export interface SignalMessage<TPayload = unknown> {
   type: SignalType;

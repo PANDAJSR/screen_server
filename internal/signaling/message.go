@@ -37,6 +37,10 @@ const (
 	MessageTypeLatencyStart = "latency-start" // begin test: server shows blue window
 	MessageTypeLatencyBlue  = "latency-blue"  // client saw blue: server flips to red
 	MessageTypeLatencyRed   = "latency-red"   // client saw red: server closes window
+
+	// Client→server log forwarding. The frontend sends structured log entries so
+	// all timing data appears in the server log stream tagged [frontend].
+	MessageTypeLog = "log"
 )
 
 // Message is the only JSON envelope used by the signaling channel.

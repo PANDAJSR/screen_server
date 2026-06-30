@@ -26,7 +26,17 @@ const (
 	videoStreamID    = "desktop"
 	videoFrameBuffer = 1
 	maxQueuedLatency = 33 * time.Millisecond
+	statsLogEvery   = 60 // frames between per-second aggregate timing logs (60fps → 1s)
 )
+
+// timedFrame wraps an encoded frame with the timing metadata needed to
+// instrument the Go-side pipeline (stdout read → channel → WriteSample).
+type timedFrame struct {
+	frame    capture.EncodedFrame
+	seq      uint64
+	tEnqueue time.Time // when placed onto the frames channel
+	tReadUs  int64     // μs spent in AnnexBReader.ReadFrame()
+}
 
 type Manager struct {
 	api           *webrtc.API
@@ -252,6 +262,14 @@ type Session struct {
 	once      sync.Once
 	done      chan struct{}
 	restartCh chan capture.FFmpegConfig
+
+	// Per-second timing accumulators (writeFrames goroutine only; single-writer,
+	// no lock needed).
+	frameSeq    uint64
+	statCount   int64
+	statReadUs  int64
+	statQueueUs int64
+	statWriteUs int64
 }
 
 func (m *Manager) newSession(clientID, room string, send func(signaling.Message)) (*Session, error) {
@@ -323,7 +341,7 @@ func (s *Session) Start(parent context.Context, cfg capture.FFmpegConfig) error 
 		return fmt.Errorf("start h264 capture: %w", err)
 	}
 
-	frames := make(chan capture.EncodedFrame, videoFrameBuffer)
+	frames := make(chan timedFrame, videoFrameBuffer)
 	go s.readFrames(cfg, stream, frames)
 	go s.writeFrames(frames)
 	go s.readRTCP()
@@ -344,7 +362,7 @@ func (s *Session) Close() {
 	})
 }
 
-func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCapture, frames chan capture.EncodedFrame) {
+func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCapture, frames chan timedFrame) {
 	defer close(frames)
 	defer func() {
 		if err := stream.Stop(); err != nil {
@@ -384,7 +402,11 @@ func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCap
 		default:
 		}
 
+		// ---- Instrumented read ----
+		tBeforeRead := time.Now()
 		frame, err := reader.ReadFrame()
+		tRead := time.Now()
+
 		if err != nil {
 			if !errors.Is(err, capture.ErrClosed) && s.ctx.Err() == nil {
 				log.Printf("read h264 frame failed client=%s err=%v", s.clientID, err)
@@ -417,15 +439,28 @@ func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCap
 		// tearing/smearing while dragging windows. Preserve bitstream continuity
 		// and let backpressure reach FFmpeg; the encoder is already constrained
 		// to the target FPS and Pion pacing keeps latency bounded.
+		s.frameSeq++
+		tf := timedFrame{
+			frame:    frame,
+			seq:      s.frameSeq,
+			tEnqueue: time.Now(),
+			tReadUs:  tRead.Sub(tBeforeRead).Microseconds(),
+		}
+		// Sample log every 120 frames (2s).
+		if s.frameSeq%120 == 0 {
+			log.Printf("[video] read seq=%d size=%d key=%v read_us=%d nalu=%v",
+				tf.seq, len(tf.frame.Data), tf.frame.IsKeyframe, tf.tReadUs, tf.frame.NALUTypes)
+		}
+
 		select {
-		case frames <- frame:
+		case frames <- tf:
 		case <-s.ctx.Done():
 			return
 		}
 	}
 }
 
-func (s *Session) writeFrames(frames <-chan capture.EncodedFrame) {
+func (s *Session) writeFrames(frames <-chan timedFrame) {
 	sentKeyframe := false
 	written := 0
 	keyframes := 0
@@ -434,20 +469,27 @@ func (s *Session) writeFrames(frames <-chan capture.EncodedFrame) {
 		select {
 		case <-s.ctx.Done():
 			return
-		case frame, ok := <-frames:
+		case tf, ok := <-frames:
 			if !ok {
 				return
 			}
+			tGot := time.Now()
 			if !sentKeyframe {
-				if !frame.IsKeyframe {
+				if !tf.frame.IsKeyframe {
 					continue
 				}
 				sentKeyframe = true
 			}
-			if err := s.track.WriteSample(media.Sample{
-				Data:     frame.Data,
-				Duration: frame.Duration,
-			}); err != nil {
+
+			// ---- Instrumented write ----
+			tBeforeWrite := time.Now()
+			err := s.track.WriteSample(media.Sample{
+				Data:     tf.frame.Data,
+				Duration: tf.frame.Duration,
+			})
+			tAfterWrite := time.Now()
+
+			if err != nil {
 				if s.ctx.Err() == nil {
 					log.Printf("write video sample failed client=%s err=%v", s.clientID, err)
 					s.Close()
@@ -455,18 +497,38 @@ func (s *Session) writeFrames(frames <-chan capture.EncodedFrame) {
 				return
 			}
 			written++
-			if frame.IsKeyframe {
+			if tf.frame.IsKeyframe {
 				keyframes++
 			}
+
+			// Accumulate per-second timing stats.
+			s.statCount++
+			s.statReadUs += tf.tReadUs
+			s.statQueueUs += tGot.Sub(tf.tEnqueue).Microseconds()
+			s.statWriteUs += tAfterWrite.Sub(tBeforeWrite).Microseconds()
+			if s.statCount >= statsLogEvery {
+				n := s.statCount
+				readAvg := float64(s.statReadUs) / float64(n)
+				queueAvg := float64(s.statQueueUs) / float64(n)
+				writeAvg := float64(s.statWriteUs) / float64(n)
+				goMs := float64(s.statReadUs+s.statQueueUs+s.statWriteUs) / 1000.0
+				log.Printf("[video] stats n=%d read_avg=%.0fus queue_avg=%.0fus write_avg=%.0fus | go_total=%.1fms",
+					n, readAvg, queueAvg, writeAvg, goMs)
+				s.statCount = 0
+				s.statReadUs = 0
+				s.statQueueUs = 0
+				s.statWriteUs = 0
+			}
+
 			if time.Since(lastLog) >= 2*time.Second {
 				log.Printf(
 					"video samples client=%s written=%d keyframes=%d last_bytes=%d last_keyframe=%v nalus=%v",
 					s.clientID,
 					written,
 					keyframes,
-					len(frame.Data),
-					frame.IsKeyframe,
-					frame.NALUTypes,
+					len(tf.frame.Data),
+					tf.frame.IsKeyframe,
+					tf.frame.NALUTypes,
 				)
 				lastLog = time.Now()
 				written = 0
