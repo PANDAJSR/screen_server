@@ -718,8 +718,8 @@ export function App() {
         const t = e.changedTouches[i];
         const ft = f.get(t.identifier);
         if (!ft) continue;
-        const dx = (t.clientX - ft.lastClientX) * scaleX;
-        const dy = (t.clientY - ft.lastClientY) * scaleY;
+        const dx = Math.round((t.clientX - ft.lastClientX) * scaleX);
+        const dy = Math.round((t.clientY - ft.lastClientY) * scaleY);
         deltas.set(t.identifier, { dx, dy });
         const d = Math.abs(dx) + Math.abs(dy);
         ft.totalDelta += d;
