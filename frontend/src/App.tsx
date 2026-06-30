@@ -697,18 +697,33 @@ export function App() {
       e.preventDefault();
       const f = fingerMapRef.current;
 
+      // Compute scale factor: 1 client pixel → remote pixels.
+      // Without this the cursor moves only a fraction of the expected distance
+      // when the remote desktop is higher-res than the viewport content area.
+      const cr = getContentRect();
+      let scaleX = 1, scaleY = 1;
+      if (cr) {
+        const video = videoRef.current;
+        const remoteW = (video && video.videoWidth) || screenSize.width;
+        const remoteH = (video && video.videoHeight) || screenSize.height;
+        if (cr.width > 0 && cr.height > 0) {
+          scaleX = remoteW / cr.width;
+          scaleY = remoteH / cr.height;
+        }
+      }
+
       // Phase 1: compute deltas for all changed fingers (before updating lastClientX/Y)
       const deltas = new Map<number, { dx: number; dy: number }>();
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i];
         const ft = f.get(t.identifier);
         if (!ft) continue;
-        const dx = t.clientX - ft.lastClientX;
-        const dy = t.clientY - ft.lastClientY;
+        const dx = (t.clientX - ft.lastClientX) * scaleX;
+        const dy = (t.clientY - ft.lastClientY) * scaleY;
         deltas.set(t.identifier, { dx, dy });
         const d = Math.abs(dx) + Math.abs(dy);
         ft.totalDelta += d;
-        if (ft.totalDelta > 3) {
+        if (ft.totalDelta > 3 * Math.max(scaleX, scaleY)) {
           ft.moved = true;
           clearLongPressTimer(); // cancel long-press if finger moved
         }
