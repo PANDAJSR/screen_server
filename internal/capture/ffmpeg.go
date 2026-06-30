@@ -1,7 +1,7 @@
 package capture
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -328,6 +328,7 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 		"-hide_banner",
 		"-loglevel", "info", // info exposes speed= lines for latency diagnosis
 		"-fflags", "nobuffer",
+		"-rtbufsize", "1M", // cap real-time capture buffer (default 3041280≈3M)
 		"-f", "gdigrab",
 		"-draw_mouse", drawMouse,
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
@@ -419,13 +420,26 @@ func ProbeEncoder(binary string) string {
 func encoderWorks(binary, enc string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary,
+
+	// Minimal test encode: a 320×240 yuv420p frame from testsrc2.
+	// Per-encoder baseline args avoid crashes from unsupported combos.
+	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "color=black:s=64x64:r=5",
+		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1",
 		"-frames:v", "1",
-		"-c:v", "h264_"+enc,
-		"-f", "null", "-",
-	)
+		"-pix_fmt", "yuv420p",
+	}
+	switch enc {
+	case "nvenc":
+		args = append(args, "-c:v", "h264_nvenc", "-preset", "p1")
+	case "qsv":
+		args = append(args, "-c:v", "h264_qsv", "-preset", "veryfast")
+	case "amf":
+		args = append(args, "-c:v", "h264_amf", "-usage", "ultralowlatency")
+	}
+	args = append(args, "-f", "null", "-")
+
+	cmd := exec.CommandContext(ctx, binary, args...)
 	if err := cmd.Run(); err != nil {
 		log.Printf("encoder probe %s failed: %v", enc, err)
 		return false
@@ -434,16 +448,51 @@ func encoderWorks(binary, enc string) bool {
 }
 
 func logFFmpeg(stderr io.Reader) {
-	scanner := bufio.NewScanner(stderr)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	// ffmpeg outputs progress lines terminated with \r (carriage return) to
+	// overwrite the terminal line, even when stderr is a pipe on some builds.
+	// bufio.Scanner would treat the entire run as one enormous line and never
+	// emit anything after the initial startup messages. Split manually on both
+	// \n and \r so every status line (including speed=) is captured.
+	buf := make([]byte, 64*1024)
+	var leftover []byte
+	for {
+		n, err := stderr.Read(buf)
+		if n > 0 {
+			data := append(leftover, buf[:n]...)
+			leftover = nil
+			for {
+				idx := bytes.IndexAny(data, "\r\n")
+				if idx < 0 {
+					leftover = append(leftover, data...)
+					break
+				}
+				line := data[:idx]
+				// Skip \r\n pair as a single delimiter.
+				skip := 1
+				if idx+1 < len(data) && data[idx] == '\r' && data[idx+1] == '\n' {
+					skip = 2
+				}
+				data = data[idx+skip:]
+				s := strings.TrimSpace(string(line))
+				if s == "" {
+					continue
+				}
+				if strings.Contains(s, "speed=") {
+					log.Printf("[ffmpeg-progress] %s", s)
+				} else {
+					log.Printf("ffmpeg: %s", s)
+				}
+			}
 		}
-		if strings.Contains(line, "speed=") {
-			log.Printf("[ffmpeg-progress] %s", line)
-		} else {
-			log.Printf("ffmpeg: %s", line)
+		if err != nil {
+			break
+		}
+	}
+	// Flush any trailing data.
+	if len(leftover) > 0 {
+		s := strings.TrimSpace(string(leftover))
+		if s != "" {
+			log.Printf("ffmpeg: %s", s)
 		}
 	}
 }
