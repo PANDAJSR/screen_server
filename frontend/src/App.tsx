@@ -826,10 +826,15 @@ export function App() {
       videoEl.addEventListener('click', handleDocumentClick);
       videoEl.addEventListener('contextmenu', handleContextMenu);
     }
-    document.addEventListener('touchstart', handleTouchStart, { passive: false });
-    document.addEventListener('touchmove', handleTouchMove, { passive: false });
-    document.addEventListener('touchend', handleTouchEnd);
-    document.addEventListener('touchcancel', handleTouchCancel);
+    // Touch handlers attach to the video element so that touches on
+    // popovers, the icon bar, and other page chrome are not swallowed by
+    // the preventDefault call inside the handler (which suppresses click events).
+    if (videoEl) {
+      videoEl.addEventListener('touchstart', handleTouchStart, { passive: false });
+      videoEl.addEventListener('touchmove', handleTouchMove, { passive: false });
+      videoEl.addEventListener('touchend', handleTouchEnd);
+      videoEl.addEventListener('touchcancel', handleTouchCancel);
+    }
 
     return () => {
       if (pingTimer !== undefined) window.clearInterval(pingTimer);
@@ -855,10 +860,12 @@ export function App() {
       heldKeys.clear();
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('keyup', handleKeyUp);
-      document.removeEventListener('touchstart', handleTouchStart);
-      document.removeEventListener('touchmove', handleTouchMove);
-      document.removeEventListener('touchend', handleTouchEnd);
-      document.removeEventListener('touchcancel', handleTouchCancel);
+      if (videoRef.current) {
+        videoRef.current.removeEventListener('touchstart', handleTouchStart);
+        videoRef.current.removeEventListener('touchmove', handleTouchMove);
+        videoRef.current.removeEventListener('touchend', handleTouchEnd);
+        videoRef.current.removeEventListener('touchcancel', handleTouchCancel);
+      }
       pcRef.current?.close();
       pcRef.current = null;
       setLogWs(null);
