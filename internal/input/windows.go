@@ -24,6 +24,21 @@ type contactState struct {
 }
 
 func newWindowsController() (Controller, error) {
+	// Declare the process as DPI-aware so that InjectSyntheticPointerInput,
+	// GetDeviceCaps, and all coordinate APIs use physical screen pixels rather
+	// than DPI-virtualized coordinates. Without this, touch injection on high-
+	// DPI displays (125%+, 150%+) maps to the wrong screen position because
+	// the client sends physical-pixel coordinates (from gdigrab) but Windows
+	// interprets them as DPI-scaled coordinates.
+	user32 := windows.NewLazyDLL("user32.dll")
+	// SetProcessDPIAware is supported since Windows Vista; it's the simplest
+	// per-process opt-out of DPI virtualization.  For per-monitor awareness
+	// (Windows 8.1+) we'd need SetProcessDpiAwareness, but system-wide DPI
+	// awareness is sufficient for a single-desktop screen server.
+	if proc := user32.NewProc("SetProcessDPIAware"); proc.Find() == nil {
+		proc.Call()
+	}
+
 	wc := &windowsController{}
 	if err := wc.initTouchInjection(); err != nil {
 		log.Printf("touch injection not available: %v", err)
@@ -148,9 +163,18 @@ func (c *windowsController) GetScreenSize() (width, height int, err error) {
 	} else {
 		defer user32.NewProc("ReleaseDC").Call(0, hdc)
 		getDeviceCaps := gdi32.NewProc("GetDeviceCaps")
-		// HORZRES=8, VERTRES=10 — width/height in pixels of the desktop.
-		w, _, _ := getDeviceCaps.Call(hdc, 8)
-		h, _, _ := getDeviceCaps.Call(hdc, 10)
+		// DESKTOPHORZRES=118, DESKTOPVERTRES=117 — physical pixel dimensions
+		// of the full virtual desktop. These indices (available Win 8.1+)
+		// are NOT subject to DPI virtualization, unlike HORZRES=8/VERTRES=10
+		// which return DPI-scaled values for non-DPI-aware processes.
+		// Using them as a safety net even after SetProcessDPIAware().
+		w, _, _ := getDeviceCaps.Call(hdc, 118)
+		h, _, _ := getDeviceCaps.Call(hdc, 117)
+		if int32(w) == 0 || int32(h) == 0 {
+			// Fallback for pre-Win8.1 (unlikely on IoT LTSC 2021).
+			w, _, _ = getDeviceCaps.Call(hdc, 8)  // HORZRES
+			h, _, _ = getDeviceCaps.Call(hdc, 10) // VERTRES
+		}
 		width = int(int32(w))
 		height = int(int32(h))
 	}
