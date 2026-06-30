@@ -355,6 +355,35 @@ p {
   box-shadow: 0 0 0 2px rgba(31, 157, 85, 0.2);
 }
 
+/* ---- Checkbox group (drag method multi-select) ---- */
+
+.checkboxGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.checkboxRow input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #1f9d55;
+  cursor: pointer;
+}
+
+.checkboxLabel {
+  font-size: 14px;
+  color: #1d2430;
+}
+
 .meta {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

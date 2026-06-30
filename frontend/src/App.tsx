@@ -50,6 +50,36 @@ interface TouchContact {
   phase: 'start' | 'move' | 'end';
 }
 
+// ---- Touch mode types ----
+
+type TouchMode = 'disabled' | 'multi-touch' | 'mouse' | 'trackpad';
+type DragMethod = 'long-press' | 'double-tap' | 'three-finger';
+
+interface FingerTrack {
+  id: number;
+  startClientX: number;
+  startClientY: number;
+  lastClientX: number;
+  lastClientY: number;
+  startTime: number;
+  totalDelta: number;
+  moved: boolean;
+}
+
+interface DragState {
+  active: boolean;
+  method: DragMethod | null;
+  buttonDown: boolean;
+  averageStartX: number;
+  averageStartY: number;
+}
+
+interface LastTapInfo {
+  time: number;
+  x: number;
+  y: number;
+}
+
 // ---- CursorOverlay — renders the OS cursor image at a screen position ----
 
 function CursorOverlay({
@@ -216,7 +246,14 @@ export function App() {
   const inputEnabledRef = useRef(true);
   const inputLockedRef = useRef(false);
   const cursorModeRef = useRef<CursorMode>('client');
-  const touchEnabledRef = useRef(true);
+  const touchModeRef = useRef<TouchMode>('multi-touch');
+  const dragMethodsRef = useRef<Set<DragMethod>>(new Set(['long-press']));
+  // Touch tracking state — lives in refs to avoid handler rebuilds and re-renders
+  const fingerMapRef = useRef<Map<number, FingerTrack>>(new Map());
+  const dragStateRef = useRef<DragState>({ active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 });
+  const lastTapRef = useRef<LastTapInfo | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const threeFingerTimerRef = useRef<number | null>(null);
   const [connectionKey, setConnectionKey] = useState(0);
   const [state, setState] = useState<ConnectionState>('connecting');
   const [clientId, setClientId] = useState<string>('');
@@ -238,7 +275,8 @@ export function App() {
   const [qualityPreset, setQualityPreset] = useState<QualityPreset>('balanced');
   const [qualityOpen, setQualityOpen] = useState(false);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
-  const [touchEnabled, setTouchEnabled] = useState(true);
+  const [touchMode, setTouchMode] = useState<TouchMode>('multi-touch');
+  const [dragMethods, setDragMethods] = useState<Set<DragMethod>>(new Set(['long-press']));
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
   const [remoteKeysPressed, setRemoteKeysPressed] = useState<number[]>([]);
@@ -264,7 +302,8 @@ export function App() {
   const prevTimeRef = useRef<number | null>(null);
 
   cursorModeRef.current = cursorMode;
-  touchEnabledRef.current = touchEnabled;
+  touchModeRef.current = touchMode;
+  dragMethodsRef.current = dragMethods;
 
   const setInputEnabledSync = (enabled: boolean) => {
     inputEnabledRef.current = enabled;
@@ -352,7 +391,7 @@ export function App() {
         if (!keyboardEnabled) return;
       }
       if (type === 'input-touch') {
-        if (!touchEnabledRef.current) return;
+        if (touchModeRef.current !== 'multi-touch') return;
         if (cursorModeRef.current === 'disabled') return;
       }
       sendSignal({ type, payload });
@@ -366,133 +405,107 @@ export function App() {
       sendInput('input-mousemove', { x: e.movementX, y: e.movementY });
     };
 
-    // Mobile / touch — dual mode:
-    //   touchEnabled ON  → native multi-touch via input-touch messages
-    //   touchEnabled OFF → legacy single-finger mouse emulation
+    // ---- Touch mode: dispatcher → mode-specific handlers ----
 
-    // Track which fingers are currently active (for cancel cleanup).
+    const clearLongPressTimer = () => {
+      if (longPressTimerRef.current != null) {
+        clearTimeout(longPressTimerRef.current);
+        longPressTimerRef.current = null;
+      }
+    };
+
+    const clearThreeFingerTimer = () => {
+      if (threeFingerTimerRef.current != null) {
+        clearTimeout(threeFingerTimerRef.current);
+        threeFingerTimerRef.current = null;
+      }
+    };
+
+    // Reset all touch tracking state (used on mode switch, reconnect, cancel).
+    const resetTouchState = () => {
+      clearLongPressTimer();
+      clearThreeFingerTimer();
+      fingerMapRef.current.clear();
+      lastTapRef.current = null;
+      if (dragStateRef.current.buttonDown) {
+        sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+      }
+      dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
+    };
+
+    // ── Multi-touch helpers (native touch injection) ──
+
+    // Track which fingers are currently active for multi-touch cancel cleanup.
     const activeTouches = new Set<number>();
 
-    const handleTouchStart = (e: TouchEvent) => {
-      if (!inputEnabledRef.current) return;
-      if (cursorModeRef.current === 'disabled') return;
-
-      if (touchEnabledRef.current) {
-        e.preventDefault();
-        // Build a set of changed identifiers so we can tell new from existing.
-        const changedIds = new Set<number>();
-        for (let i = 0; i < e.changedTouches.length; i++) {
-          changedIds.add(e.changedTouches[i].identifier);
-        }
-        const touches: TouchContact[] = [];
-        // Include ALL active touches so Windows sees the full contact set.
-        for (let i = 0; i < e.touches.length; i++) {
-          const t = e.touches[i];
-          activeTouches.add(t.identifier);
-          const remote = mapClientToRemote(t.clientX, t.clientY);
-          if (!remote) continue;
-          if (changedIds.has(t.identifier)) {
-            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "start" });
-          } else {
-            // Existing contact — keep alive with a move update.
-            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
-          }
-        }
-        if (touches.length > 0) {
-          sendInput("input-touch", { touches });
-        }
-        return;
+    const handleMultiTouchStart = (e: TouchEvent) => {
+      e.preventDefault();
+      const changedIds = new Set<number>();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        changedIds.add(e.changedTouches[i].identifier);
       }
-
-      // Legacy: single finger → absolute mouse + left button
-      if (e.touches.length !== 1) return;
-      const t = e.touches[0];
-      const remote = mapClientToRemote(t.clientX, t.clientY);
-      if (remote) {
-        sendInput('input-mousemove-abs', { x: remote.x, y: remote.y });
-        sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+      const touches: TouchContact[] = [];
+      for (let i = 0; i < e.touches.length; i++) {
+        const t = e.touches[i];
+        activeTouches.add(t.identifier);
+        const remote = mapClientToRemote(t.clientX, t.clientY);
+        if (!remote) continue;
+        if (changedIds.has(t.identifier)) {
+          touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "start" });
+        } else {
+          touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
+        }
+      }
+      if (touches.length > 0) {
+        sendInput("input-touch", { touches });
       }
     };
 
-    const handleTouchMove = (e: TouchEvent) => {
-      if (!inputEnabledRef.current) return;
-      if (cursorModeRef.current === 'disabled') return;
-
-      if (touchEnabledRef.current) {
-        e.preventDefault();
-        // Include ALL active touches so Windows sees the full contact set.
-        const touches: TouchContact[] = [];
-        for (let i = 0; i < e.touches.length; i++) {
-          const t = e.touches[i];
-          const remote = mapClientToRemote(t.clientX, t.clientY);
-          if (remote) {
-            touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
-          }
+    const handleMultiTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+      const touches: TouchContact[] = [];
+      for (let i = 0; i < e.touches.length; i++) {
+        const t = e.touches[i];
+        const remote = mapClientToRemote(t.clientX, t.clientY);
+        if (remote) {
+          touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
         }
-        if (touches.length > 0) {
-          sendInput("input-touch", { touches });
-        }
-        return;
       }
-
-      // Legacy: single finger → absolute mouse move
-      if (e.touches.length !== 1) return;
-      const t = e.touches[0];
-      const remote = mapClientToRemote(t.clientX, t.clientY);
-      if (remote) {
-        sendInput('input-mousemove-abs', { x: remote.x, y: remote.y });
+      if (touches.length > 0) {
+        sendInput("input-touch", { touches });
       }
     };
 
-    const handleTouchEnd = (e: TouchEvent) => {
-      if (!inputEnabledRef.current) return;
-      if (cursorModeRef.current === 'disabled') return;
-
-      if (touchEnabledRef.current) {
-        e.preventDefault(); // suppress browser-synthesized mouse events
-        // Build a set of ended identifiers; other fingers stay alive.
-        const endedIds = new Set<number>();
-        for (let i = 0; i < e.changedTouches.length; i++) {
-          endedIds.add(e.changedTouches[i].identifier);
-          activeTouches.delete(e.changedTouches[i].identifier);
-        }
-        const touches: TouchContact[] = [];
-        // Include ALL active touches (changed + remaining).
-        for (let i = 0; i < e.touches.length; i++) {
-          const t = e.touches[i];
-          const remote = mapClientToRemote(t.clientX, t.clientY);
-          if (!remote) continue;
-          touches.push({
-            id: t.identifier,
-            x: remote.x,
-            y: remote.y,
-            phase: "move",
-          });
-        }
-        // Now send the ended touches with phase=end and their last position.
-        for (let i = 0; i < e.changedTouches.length; i++) {
-          const t = e.changedTouches[i];
-          const remote = mapClientToRemote(t.clientX, t.clientY);
-          touches.push({
-            id: t.identifier,
-            x: remote ? remote.x : 0,
-            y: remote ? remote.y : 0,
-            phase: "end",
-          });
-        }
-        if (touches.length > 0) {
-          sendInput("input-touch", { touches });
-        }
-        return;
+    const handleMultiTouchEnd = (e: TouchEvent) => {
+      e.preventDefault();
+      const endedIds = new Set<number>();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        endedIds.add(e.changedTouches[i].identifier);
+        activeTouches.delete(e.changedTouches[i].identifier);
       }
-
-      // Legacy: release left mouse button
-      sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+      const touches: TouchContact[] = [];
+      for (let i = 0; i < e.touches.length; i++) {
+        const t = e.touches[i];
+        const remote = mapClientToRemote(t.clientX, t.clientY);
+        if (!remote) continue;
+        touches.push({ id: t.identifier, x: remote.x, y: remote.y, phase: "move" });
+      }
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        const remote = mapClientToRemote(t.clientX, t.clientY);
+        touches.push({
+          id: t.identifier,
+          x: remote ? remote.x : 0,
+          y: remote ? remote.y : 0,
+          phase: "end",
+        });
+      }
+      if (touches.length > 0) {
+        sendInput("input-touch", { touches });
+      }
     };
 
-    const handleTouchCancel = (e: TouchEvent) => {
-      if (!touchEnabledRef.current) return;
-      // Cancel all active touches — send "end" for each.
+    const handleMultiTouchCancel = (e: TouchEvent) => {
       const touches: TouchContact[] = [];
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i];
@@ -503,6 +516,427 @@ export function App() {
         sendInput('input-touch', { touches });
       }
     };
+
+    // ── Mouse mode helpers (single-finger, absolute positioning) ──
+
+    let mouseTrackedId: number | null = null;
+
+    const handleMouseModeStart = (e: TouchEvent) => {
+      // Only track the first finger
+      if (mouseTrackedId != null) return;
+      if (e.changedTouches.length === 0) return;
+      const t = e.changedTouches[0];
+      mouseTrackedId = t.identifier;
+      const f = fingerMapRef.current;
+      f.set(t.identifier, {
+        id: t.identifier,
+        startClientX: t.clientX,
+        startClientY: t.clientY,
+        lastClientX: t.clientX,
+        lastClientY: t.clientY,
+        startTime: performance.now(),
+        totalDelta: 0,
+        moved: false,
+      });
+      // No immediate input — defer to move/end for tap vs drag detection
+    };
+
+    const handleMouseModeMove = (e: TouchEvent) => {
+      const f = fingerMapRef.current;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (t.identifier !== mouseTrackedId) continue;
+        const ft = f.get(t.identifier);
+        if (!ft) continue;
+        const dx = Math.abs(t.clientX - ft.startClientX);
+        const dy = Math.abs(t.clientY - ft.startClientY);
+        ft.totalDelta = dx + dy;
+        ft.lastClientX = t.clientX;
+        ft.lastClientY = t.clientY;
+        if (ft.totalDelta > 5) {
+          ft.moved = true;
+          // Start drag if not already dragging
+          if (!dragStateRef.current.active) {
+            dragStateRef.current = { active: true, method: null, buttonDown: true, averageStartX: 0, averageStartY: 0 };
+            const remote = mapClientToRemote(ft.startClientX, ft.startClientY);
+            if (remote) {
+              sendInput('input-mousemove-abs', { x: remote.x, y: remote.y });
+              sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+            }
+          }
+        }
+        if (ft.moved && dragStateRef.current.active) {
+          const remote = mapClientToRemote(t.clientX, t.clientY);
+          if (remote) {
+            sendInput('input-mousemove-abs', { x: remote.x, y: remote.y });
+          }
+        }
+      }
+    };
+
+    const handleMouseModeEnd = (e: TouchEvent) => {
+      const f = fingerMapRef.current;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (t.identifier !== mouseTrackedId) continue;
+        const ft = f.get(t.identifier);
+        mouseTrackedId = null;
+        if (!ft) return;
+        f.delete(t.identifier);
+
+        if (dragStateRef.current.active && dragStateRef.current.buttonDown) {
+          // Release drag
+          sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+          dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
+        } else {
+          // Short tap → move + click
+          const duration = performance.now() - ft.startTime;
+          if (duration < 300 && ft.totalDelta < 10) {
+            const remote = mapClientToRemote(ft.startClientX, ft.startClientY);
+            if (remote) {
+              sendInput('input-mousemove-abs', { x: remote.x, y: remote.y });
+              sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+              sendInput('input-mousebtn', { button: 1, pressed: false, x: remote.x, y: remote.y });
+            }
+          }
+        }
+        break; // only process the tracked finger
+      }
+    };
+
+    const handleMouseModeCancel = () => {
+      if (dragStateRef.current.buttonDown) {
+        sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+      }
+      fingerMapRef.current.clear();
+      mouseTrackedId = null;
+      dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
+    };
+
+    // ── Trackpad mode helpers (relative movement + drag state machine) ──
+
+    const handleTrackpadStart = (e: TouchEvent) => {
+      e.preventDefault();
+      const f = fingerMapRef.current;
+      const now = performance.now();
+
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        f.set(t.identifier, {
+          id: t.identifier,
+          startClientX: t.clientX,
+          startClientY: t.clientY,
+          lastClientX: t.clientX,
+          lastClientY: t.clientY,
+          startTime: now,
+          totalDelta: 0,
+          moved: false,
+        });
+      }
+
+      // Double-tap detection: second tap within 0.5s after a single tap
+      if (f.size === 1 && lastTapRef.current && dragMethodsRef.current.has('double-tap')) {
+        const tap = lastTapRef.current;
+        if (now - tap.time < 500) {
+          // Enter double-tap drag mode
+          clearLongPressTimer();
+          lastTapRef.current = null;
+          dragStateRef.current = { active: true, method: 'double-tap', buttonDown: true, averageStartX: 0, averageStartY: 0 };
+          const remote = mapClientToRemote(tap.x, tap.y);
+          if (remote) {
+            sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+          }
+          return;
+        }
+      }
+
+      // Three-finger drag: enter or re-enter
+      if (f.size >= 3 && dragMethodsRef.current.has('three-finger')) {
+        clearLongPressTimer();
+        clearThreeFingerTimer();
+
+        if (dragStateRef.current.active && dragStateRef.current.method === 'three-finger') {
+          // Re-grab within 0.6s — continue seamlessly
+          dragStateRef.current.buttonDown = true;
+        } else if (!dragStateRef.current.active) {
+          // Start three-finger drag
+          // Use first 3 fingers for average start position
+          const fingers = Array.from(f.values()).slice(0, 3);
+          const avgX = fingers.reduce((s, ft) => s + ft.startClientX, 0) / fingers.length;
+          const avgY = fingers.reduce((s, ft) => s + ft.startClientY, 0) / fingers.length;
+          const remote = mapClientToRemote(avgX, avgY);
+          dragStateRef.current = { active: true, method: 'three-finger', buttonDown: true, averageStartX: remote ? remote.x : 0, averageStartY: remote ? remote.y : 0 };
+          if (remote) {
+            sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+          }
+        }
+        return;
+      }
+
+      // Long-press timer for single finger, if not already dragging
+      if (f.size === 1 && !dragStateRef.current.active && dragMethodsRef.current.has('long-press')) {
+        const ft = f.values().next().value as FingerTrack;
+        clearLongPressTimer();
+        longPressTimerRef.current = window.setTimeout(() => {
+          // Check finger is still down and hasn't moved significantly
+          const cur = f.get(ft.id);
+          if (cur && !cur.moved) {
+            if (navigator.vibrate) navigator.vibrate(50);
+            const remote = mapClientToRemote(cur.startClientX, cur.startClientY);
+            if (remote) {
+              dragStateRef.current = { active: true, method: 'long-press', buttonDown: true, averageStartX: 0, averageStartY: 0 };
+              sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+            }
+          }
+          longPressTimerRef.current = null;
+        }, 800);
+      }
+    };
+
+    const handleTrackpadMove = (e: TouchEvent) => {
+      e.preventDefault();
+      const f = fingerMapRef.current;
+
+      // Phase 1: compute deltas for all changed fingers (before updating lastClientX/Y)
+      const deltas = new Map<number, { dx: number; dy: number }>();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        const ft = f.get(t.identifier);
+        if (!ft) continue;
+        const dx = t.clientX - ft.lastClientX;
+        const dy = t.clientY - ft.lastClientY;
+        deltas.set(t.identifier, { dx, dy });
+        const d = Math.abs(dx) + Math.abs(dy);
+        ft.totalDelta += d;
+        if (ft.totalDelta > 3) {
+          ft.moved = true;
+          clearLongPressTimer(); // cancel long-press if finger moved
+        }
+      }
+
+      // Phase 2: send movement using recorded deltas
+      if (dragStateRef.current.active && dragStateRef.current.buttonDown) {
+        if (dragStateRef.current.method === 'three-finger') {
+          if (f.size >= 3) {
+            let totalDx = 0, totalDy = 0, count = 0;
+            for (const [id] of f) {
+              const d = deltas.get(id);
+              if (d) { totalDx += d.dx; totalDy += d.dy; count++; }
+            }
+            if (count > 0) {
+              const dx = Math.round(totalDx / count);
+              const dy = Math.round(totalDy / count);
+              if (dx !== 0 || dy !== 0) {
+                sendInput('input-mousemove', { x: dx, y: dy });
+              }
+            }
+          }
+        } else {
+          // long-press or double-tap: single finger delta
+          if (f.size === 1) {
+            const ft = f.values().next().value as FingerTrack;
+            const d = deltas.get(ft.id);
+            if (d && (d.dx !== 0 || d.dy !== 0)) {
+              sendInput('input-mousemove', { x: d.dx, y: d.dy });
+            }
+          }
+        }
+      } else {
+        // Not dragging — normal relative movement
+        if (f.size === 1) {
+          const ft = f.values().next().value as FingerTrack;
+          const d = deltas.get(ft.id);
+          if (d && (d.dx !== 0 || d.dy !== 0)) {
+            sendInput('input-mousemove', { x: d.dx, y: d.dy });
+          }
+        } else if (f.size === 2) {
+          // Two-finger scroll
+          const fingers = Array.from(f.values());
+          const d1 = deltas.get(fingers[0].id);
+          const d2 = deltas.get(fingers[1].id);
+          if (d1 && d2) {
+            const avgDx = (d1.dx + d2.dx) / 2;
+            const avgDy = (d1.dy + d2.dy) / 2;
+            if (Math.abs(avgDy) >= Math.abs(avgDx)) {
+              if (Math.abs(avgDy) > 0.5) {
+                sendInput('input-scroll', { dx: 0, dy: avgDy * 2 });
+              }
+            } else {
+              if (Math.abs(avgDx) > 0.5) {
+                sendInput('input-mousemove', { x: avgDx, y: avgDy });
+              }
+            }
+          }
+        }
+      }
+
+      // Phase 3: update tracking positions AFTER sending movement
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        const ft = f.get(t.identifier);
+        if (ft) {
+          ft.lastClientX = t.clientX;
+          ft.lastClientY = t.clientY;
+        }
+      }
+    };
+
+    const handleTrackpadEnd = (e: TouchEvent) => {
+      e.preventDefault();
+      const f = fingerMapRef.current;
+      const now = performance.now();
+
+      if (dragStateRef.current.active && dragStateRef.current.buttonDown) {
+        if (dragStateRef.current.method === 'three-finger') {
+          // Check if any fingers remain; if not, start 0.6s release timer
+          // (only count fingers in current changed list that are being removed)
+          const endedIds = new Set<number>();
+          for (let i = 0; i < e.changedTouches.length; i++) {
+            endedIds.add(e.changedTouches[i].identifier);
+          }
+          // Remove ended fingers from our tracking
+          for (const id of endedIds) {
+            f.delete(id);
+          }
+          if (f.size < 3) {
+            // Start 0.6s grace period for re-grab
+            clearThreeFingerTimer();
+            threeFingerTimerRef.current = window.setTimeout(() => {
+              if (dragStateRef.current.buttonDown) {
+                sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+                dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
+              }
+              threeFingerTimerRef.current = null;
+            }, 600);
+          }
+          return; // Don't clean up fingers — they're already removed above
+        } else {
+          // long-press or double-tap: release mouse on any finger up
+          sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+          dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
+        }
+      } else {
+        // Not dragging — detect taps
+        // Two-finger tap → right click
+        if (e.changedTouches.length === 2) {
+          const t1 = e.changedTouches[0];
+          const t2 = e.changedTouches[1];
+          const ft1 = f.get(t1.identifier);
+          const ft2 = f.get(t2.identifier);
+          if (ft1 && ft2) {
+            const d1 = performance.now() - ft1.startTime;
+            const d2 = performance.now() - ft2.startTime;
+            if (d1 < 300 && d2 < 300 && ft1.totalDelta < 10 && ft2.totalDelta < 10) {
+              const remote = mapClientToRemote(
+                (ft1.startClientX + ft2.startClientX) / 2,
+                (ft1.startClientY + ft2.startClientY) / 2,
+              );
+              if (remote) {
+                sendInput('input-mousebtn', { button: 2, pressed: true, x: remote.x, y: remote.y });
+                sendInput('input-mousebtn', { button: 2, pressed: false, x: remote.x, y: remote.y });
+              }
+            }
+          }
+        }
+
+        // Single-finger tap → left click (only if double-tap didn't trigger)
+        if (e.changedTouches.length === 1) {
+          const t = e.changedTouches[0];
+          const ft = f.get(t.identifier);
+          if (ft) {
+            const duration = now - ft.startTime;
+            if (!ft.moved && duration < 300) {
+              // Only register last-tap for double-tap if not already in drag mode
+              // and the tap didn't just trigger drag (checked above)
+              if (dragMethodsRef.current.has('double-tap') && !dragStateRef.current.active) {
+                lastTapRef.current = { time: now, x: t.clientX, y: t.clientY };
+              }
+              const remote = mapClientToRemote(t.clientX, t.clientY);
+              if (remote) {
+                sendInput('input-mousebtn', { button: 1, pressed: true, x: remote.x, y: remote.y });
+                sendInput('input-mousebtn', { button: 1, pressed: false, x: remote.x, y: remote.y });
+              }
+            }
+          }
+        }
+      }
+
+      // Clean up ended fingers from tracking
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        f.delete(e.changedTouches[i].identifier);
+      }
+
+      // Clear last-tap after 0.5s if no double-tap happened
+      if (lastTapRef.current && now - lastTapRef.current.time > 500) {
+        lastTapRef.current = null;
+      }
+    };
+
+    const handleTrackpadCancel = (_e: TouchEvent) => {
+      clearLongPressTimer();
+      clearThreeFingerTimer();
+      if (dragStateRef.current.buttonDown) {
+        sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+      }
+      fingerMapRef.current.clear();
+      lastTapRef.current = null;
+      dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
+    };
+
+    // ── Top-level dispatcher handlers (attached to video element) ──
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (!inputEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
+
+      switch (touchModeRef.current) {
+        case 'disabled': return;
+        case 'multi-touch': handleMultiTouchStart(e); break;
+        case 'mouse': handleMouseModeStart(e); break;
+        case 'trackpad': handleTrackpadStart(e); break;
+      }
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!inputEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
+
+      switch (touchModeRef.current) {
+        case 'disabled': return;
+        case 'multi-touch': handleMultiTouchMove(e); break;
+        case 'mouse': handleMouseModeMove(e); break;
+        case 'trackpad': handleTrackpadMove(e); break;
+      }
+    };
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      if (!inputEnabledRef.current) return;
+      if (cursorModeRef.current === 'disabled') return;
+
+      switch (touchModeRef.current) {
+        case 'disabled': return;
+        case 'multi-touch': handleMultiTouchEnd(e); break;
+        case 'mouse': handleMouseModeEnd(e); break;
+        case 'trackpad': handleTrackpadEnd(e); break;
+      }
+    };
+
+    const handleTouchCancel = (e: TouchEvent) => {
+      switch (touchModeRef.current) {
+        case 'disabled': return;
+        case 'multi-touch': handleMultiTouchCancel(e); break;
+        case 'mouse': handleMouseModeCancel(); break;
+        case 'trackpad': handleTrackpadCancel(e); break;
+      }
+    };
+
+    // Helper: find a touch by identifier in a TouchList
+    function findTouchById(list: TouchList, id: number): Touch | undefined {
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].identifier === id) return list[i];
+      }
+      return undefined;
+    }
 
     // Mouse buttons (shared between modes)
     // Physical mouse clicks are always handled here regardless of touch mode.
@@ -843,6 +1277,16 @@ export function App() {
       if (iceStatsTimer !== undefined) window.clearInterval(iceStatsTimer);
       if (latencyRafRef.current != null) cancelAnimationFrame(latencyRafRef.current);
       if (latencyTimeoutRef.current != null) clearTimeout(latencyTimeoutRef.current);
+      // Reset touch tracking state on reconnect
+      if (longPressTimerRef.current != null) clearTimeout(longPressTimerRef.current);
+      if (threeFingerTimerRef.current != null) clearTimeout(threeFingerTimerRef.current);
+      fingerMapRef.current.clear();
+      lastTapRef.current = null;
+      if (dragStateRef.current.buttonDown) {
+        // If mouse button is held, release it before reconnect
+        sendInput('input-mousebtn', { button: 1, pressed: false, x: 0, y: 0 });
+      }
+      dragStateRef.current = { active: false, method: null, buttonDown: false, averageStartX: 0, averageStartY: 0 };
       if (document.pointerLockElement === videoRef.current) document.exitPointerLock();
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
       document.removeEventListener('mousemove', handleMouseMoveRemote);
@@ -876,7 +1320,7 @@ export function App() {
         videoRef.current.srcObject = null;
       }
     };
-  }, [room, connectionKey, keyboardEnabled, touchEnabled]);
+  }, [room, connectionKey, keyboardEnabled]);
 
   // ---- Client / remote-render cursor mode: video mousemove → absolute position + cursor overlay ----
 
@@ -890,6 +1334,9 @@ export function App() {
       const mode = cursorModeRef.current;
       if (mode !== 'client' && mode !== 'remote-render') return;
       if (!inputEnabledRef.current) return;
+      // Don't send absolute mouse position from physical mouse when touch mode
+      // is trackpad or mouse — the touch handlers manage all input.
+      if (touchModeRef.current === 'trackpad' || touchModeRef.current === 'mouse') return;
 
       // Update cursor overlay position instantly for client mode (zero latency)
       if (mode === 'client') {
@@ -1082,6 +1529,8 @@ export function App() {
       return inputLocked ? '点击或按 ESC 释放' : '点击视频锁定鼠标';
     }
     if (cursorMode === 'remote-render') return '输入已启用（光标在视频中渲染）';
+    if (touchMode === 'trackpad') return '触摸板模式（相对移动）';
+    if (touchMode === 'mouse') return '模拟鼠标模式（绝对定位）';
     return '输入已启用（客户端光标模式）';
   };
 
@@ -1166,7 +1615,54 @@ export function App() {
             </select>
           </div>
           <Toggle label="键盘" checked={keyboardEnabled} onChange={setKeyboardEnabled} />
-          <Toggle label="触摸" checked={touchEnabled} onChange={(v) => { setTouchEnabled(v); }} />
+          {/* Touch mode dropdown */}
+          <div className="selectRow">
+            <span className="selectLabel">触摸</span>
+            <select
+              className="cursorModeSelect"
+              value={touchMode}
+              onChange={(e) => {
+                const mode = e.target.value as TouchMode;
+                setTouchMode(mode);
+                touchModeRef.current = mode;
+              }}
+            >
+              <option value="disabled">禁用</option>
+              <option value="multi-touch">多点触摸</option>
+              <option value="mouse">模拟鼠标</option>
+              <option value="trackpad">模拟触摸板</option>
+            </select>
+          </div>
+
+          {/* Drag method checkboxes — only shown in trackpad mode */}
+          {touchMode === 'trackpad' && (
+            <div className="checkboxGroup">
+              <span className="selectLabel">拖动方法</span>
+              {(['long-press', 'double-tap', 'three-finger'] as DragMethod[]).map((method) => {
+                const labels: Record<DragMethod, string> = {
+                  'long-press': '长按',
+                  'double-tap': '双击',
+                  'three-finger': '三指',
+                };
+                const checked = dragMethods.has(method);
+                return (
+                  <label key={method} className="checkboxRow">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(e) => {
+                        const next = new Set(dragMethods);
+                        e.target.checked ? next.add(method) : next.delete(method);
+                        setDragMethods(next);
+                        dragMethodsRef.current = next;
+                      }}
+                    />
+                    <span className="checkboxLabel">{labels[method]}</span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
           <div className="keyStateSection">
             <span className="keyStateLabel">远端按键</span>
             {remoteKeysPressed.length === 0 ? (
@@ -1185,11 +1681,15 @@ export function App() {
           <div className="inputHint">
             {cursorMode === 'disabled'
               ? '鼠标输入已禁用'
-              : cursorMode === 'remote'
-                ? (inputLocked ? '点击或按 ESC 释放' : '点击视频锁定鼠标')
-                : cursorMode === 'remote-render'
-                  ? '移动鼠标到视频上即可控制远程（光标在视频中渲染）'
-                  : '移动鼠标到视频上即可控制远程'}
+              : touchMode === 'trackpad'
+                ? '触摸板模式：滑动=移动光标，点按=点击，双指=右键，双指滑动=滚动'
+                : touchMode === 'mouse'
+                  ? '模拟鼠标模式：点按=点击，拖动=拖拽'
+                : cursorMode === 'remote'
+                  ? (inputLocked ? '点击或按 ESC 释放' : '点击视频锁定鼠标')
+                  : cursorMode === 'remote-render'
+                    ? '移动鼠标到视频上即可控制远程（光标在视频中渲染）'
+                    : '移动鼠标到视频上即可控制远程'}
           </div>
         </div>
       )}
@@ -1238,17 +1738,17 @@ export function App() {
           playsInline
           muted
           controls={false}
-          style={inputEnabled && (cursorMode === 'client' || cursorMode === 'remote-render') ? { cursor: 'none' } : undefined}
+          style={inputEnabled && (cursorMode === 'client' || cursorMode === 'remote-render' || touchMode === 'trackpad' || touchMode === 'mouse') ? { cursor: 'none' } : undefined}
         />
         {inputEnabled && overlayText && (
           <div className="inputOverlay"><span>{overlayText}</span></div>
         )}
-        {/* Remote cursor mode: overlay follows server cursor-pos */}
-        {inputEnabled && cursorMode === 'remote' && (
+        {/* Remote cursor overlay: shown for remote mode, or when touchMode is trackpad/mouse */}
+        {inputEnabled && (cursorMode === 'remote' || touchMode === 'trackpad' || touchMode === 'mouse') && (
           <RemoteCursor videoRef={videoRef} cursorPos={cursorPos} screenSize={screenSize} cursorImage={cursorImage} />
         )}
-        {/* Client cursor mode: overlay follows local mouse position (zero latency) */}
-        {inputEnabled && cursorMode === 'client' && (
+        {/* Client cursor overlay: only when cursorMode=client AND not in trackpad/mouse touch mode */}
+        {inputEnabled && cursorMode === 'client' && touchMode !== 'trackpad' && touchMode !== 'mouse' && (
           <CursorOverlay position={clientCursorScreenPos} cursorImage={cursorImage} />
         )}
         {/* Remote-render mode: cursor is rendered in the video stream — no overlay needed */}
