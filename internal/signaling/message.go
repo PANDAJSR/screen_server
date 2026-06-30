@@ -17,6 +17,9 @@ const (
 	MessageTypeCandidate   = "candidate"
 	MessageTypeError       = "error"
 
+	// Quality preset message — client selects a quality/latency trade-off.
+	MessageTypeQualityPreset = "quality-preset"
+
 	// Input control message types
 	MessageTypeInputMode          = "input-mode"           // enable/disable control mode
 	MessageTypeInputKeyDown       = "input-keydown"        // key press

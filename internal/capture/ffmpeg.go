@@ -36,6 +36,17 @@ type FFmpegConfig struct {
 	// offload the encode stage from the CPU and cut end-to-end latency without
 	// touching bitrate, FPS, or resolution.
 	Encoder string
+	// Profile selects the H.264 profile: "baseline", "main", or "high".
+	// High profile enables CABAC and 8×8 transforms, giving ~15-20% better
+	// compression at the same bitrate with zero added latency for modern
+	// hardware decoders.
+	Profile string
+	// NvencPreset overrides the NVENC quality preset (p1–p7). p1=fastest,
+	// p7=best quality. Default "p2" balances speed and compression.
+	NvencPreset string
+	// X264Preset overrides the libx264 speed preset. "ultrafast" is fastest,
+	// "veryslow" is best quality. Default "superfast" for low-latency encoding.
+	X264Preset string
 }
 
 func DefaultFFmpegConfig() FFmpegConfig {
@@ -43,11 +54,14 @@ func DefaultFFmpegConfig() FFmpegConfig {
 		Binary:      "ffmpeg",
 		Device:      defaultScreenDevice(),
 		FPS:         30,
-		Bitrate:     "8M",
-		MaxRate:     "12M",
-		BufferSize:  "1M",
-		GOP:         7, // keyframe every ~233ms at 30fps
+		Bitrate:     "20M",
+		MaxRate:     "30M",
+		BufferSize:  "10M",
+		GOP:         60, // keyframe every 2s at 30fps; enough for LAN packet-loss recovery
 		UseHardware: true,
+		Profile:     "high",
+		NvencPreset: "p2",
+		X264Preset:  "superfast",
 	}
 }
 
@@ -174,6 +188,10 @@ func buildFFmpegArgs(cfg FFmpegConfig) []string {
 }
 
 func buildImagePipeArgs(cfg FFmpegConfig) []string {
+	profile := cfg.Profile
+	if profile == "" {
+		profile = "high"
+	}
 	return []string{
 		"-hide_banner",
 		"-loglevel", "warning",
@@ -185,14 +203,14 @@ func buildImagePipeArgs(cfg FFmpegConfig) []string {
 		"-an",
 		"-vf", "format=nv12",
 		"-c:v", "libx264",
-		"-preset", "ultrafast",
+		"-preset", x264Preset(cfg),
 		"-tune", "zerolatency",
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
 		"-bufsize", cfg.BufferSize,
 		"-g", fmt.Sprintf("%d", cfg.GOP),
 		"-bf", "0",
-		"-profile:v", "baseline",
+		"-profile:v", profile,
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-f", "h264",
 		"pipe:1",
@@ -200,6 +218,10 @@ func buildImagePipeArgs(cfg FFmpegConfig) []string {
 }
 
 func buildTestSourceArgs(cfg FFmpegConfig) []string {
+	profile := cfg.Profile
+	if profile == "" {
+		profile = "high"
+	}
 	return []string{
 		"-hide_banner",
 		"-loglevel", "warning",
@@ -210,14 +232,14 @@ func buildTestSourceArgs(cfg FFmpegConfig) []string {
 		"-an",
 		"-vf", "format=nv12",
 		"-c:v", "libx264",
-		"-preset", "ultrafast",
+		"-preset", x264Preset(cfg),
 		"-tune", "zerolatency",
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
 		"-bufsize", cfg.BufferSize,
 		"-g", fmt.Sprintf("%d", cfg.GOP),
 		"-bf", "0",
-		"-profile:v", "baseline",
+		"-profile:v", profile,
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-f", "h264",
 		"pipe:1",
@@ -229,35 +251,28 @@ func buildDarwinArgs(cfg FFmpegConfig) []string {
 	if cfg.UseHardware {
 		codec = "h264_videotoolbox"
 	}
+	profile := cfg.Profile
+	if profile == "" {
+		profile = "high"
+	}
 	captureCursor := "0"
 	if cfg.DrawMouse {
 		captureCursor = "1"
 	}
-	args := []string{
-		"-hide_banner",
-		"-loglevel", "warning",
-		"-fflags", "nobuffer",
-		"-f", "avfoundation",
-		"-capture_cursor", captureCursor,
-		"-capture_mouse_clicks", "0",
-		"-framerate", fmt.Sprintf("%d", cfg.FPS),
-		"-pixel_format", "bgr0",
-		"-i", cfg.Device,
-		"-an",
-		"-vf", fmt.Sprintf("fps=%d,format=nv12", cfg.FPS),
-		"-c:v", codec,
+	// Shared tail: bitrate / GOP / no B-frames / profile / AUD.
+	sharedTail := []string{
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
 		"-bufsize", cfg.BufferSize,
 		"-g", fmt.Sprintf("%d", cfg.GOP),
 		"-bf", "0",
-		"-profile:v", "baseline",
+		"-profile:v", profile,
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-f", "h264",
 		"pipe:1",
 	}
 	if cfg.UseHardware {
-		args = append([]string{
+		return append([]string{
 			"-hide_banner",
 			"-loglevel", "warning",
 			"-fflags", "nobuffer",
@@ -272,24 +287,34 @@ func buildDarwinArgs(cfg FFmpegConfig) []string {
 			"-c:v", codec,
 			"-realtime", "1",
 			"-allow_sw", "1",
-			"-b:v", cfg.Bitrate,
-			"-maxrate", cfg.MaxRate,
-			"-bufsize", cfg.BufferSize,
-			"-g", fmt.Sprintf("%d", cfg.GOP),
-			"-bf", "0",
-			"-profile:v", "baseline",
-			"-bsf:v", "h264_metadata=aud=insert",
-			"-f", "h264",
-			"pipe:1",
-		})
+		}, sharedTail...)
 	}
-	return args
+	return append([]string{
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-fflags", "nobuffer",
+		"-f", "avfoundation",
+		"-capture_cursor", captureCursor,
+		"-capture_mouse_clicks", "0",
+		"-framerate", fmt.Sprintf("%d", cfg.FPS),
+		"-pixel_format", "bgr0",
+		"-i", cfg.Device,
+		"-an",
+		"-vf", fmt.Sprintf("fps=%d,format=nv12", cfg.FPS),
+		"-c:v", codec,
+		"-preset", x264Preset(cfg),
+		"-tune", "zerolatency",
+	}, sharedTail...)
 }
 
 func buildX11Args(cfg FFmpegConfig) []string {
 	drawMouse := "0"
 	if cfg.DrawMouse {
 		drawMouse = "1"
+	}
+	profile := cfg.Profile
+	if profile == "" {
+		profile = "high"
 	}
 	return []string{
 		"-hide_banner",
@@ -301,14 +326,14 @@ func buildX11Args(cfg FFmpegConfig) []string {
 		"-i", cfg.Device,
 		"-an",
 		"-c:v", "libx264",
-		"-preset", "ultrafast",
+		"-preset", x264Preset(cfg),
 		"-tune", "zerolatency",
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
 		"-bufsize", cfg.BufferSize,
 		"-g", fmt.Sprintf("%d", cfg.GOP),
 		"-bf", "0",
-		"-profile:v", "baseline",
+		"-profile:v", profile,
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-f", "h264",
 		"pipe:1",
@@ -320,9 +345,13 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	if cfg.DrawMouse {
 		drawMouse = "1"
 	}
+	profile := cfg.Profile
+	if profile == "" {
+		profile = "high"
+	}
 	// Input + output options shared by every encoder. Hardware encoders differ
-	// only in the codec/preset/RC block; bitrate, GOP, no B-frames, baseline
-	// profile and AUD insertion stay identical so quality and the Annex-B frame
+	// only in the codec/preset/RC block; bitrate, GOP, no B-frames, profile
+	// and AUD insertion stay identical so quality and the Annex-B frame
 	// framing are unchanged versus the software path.
 	common := []string{
 		"-hide_banner",
@@ -349,7 +378,7 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 		"-bufsize", cfg.BufferSize,
 		"-g", fmt.Sprintf("%d", cfg.GOP),
 		"-bf", "0",
-		"-profile:v", "baseline",
+		"-profile:v", profile,
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-f", "h264",
 		"pipe:1",
@@ -358,14 +387,18 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	var enc []string
 	switch cfg.Encoder {
 	case "nvenc":
-		// NV12+hwupload_cuda → one GPU upload, nvenc reads from VRAM directly.
+		nvencPreset := cfg.NvencPreset
+		if nvencPreset == "" {
+			nvencPreset = "p2"
+		}
 		enc = []string{
 			"-vf", "format=nv12,hwupload_cuda",
 			"-c:v", "h264_nvenc",
-			"-preset", "p1",
+			"-preset", nvencPreset,
 			"-tune", "ll",
 			"-rc", "cbr",
 			"-delay", "0",
+			"-spatial_aq", "1",
 		}
 	case "qsv":
 		enc = []string{
@@ -373,25 +406,42 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 			"-c:v", "h264_qsv",
 			"-preset", "veryfast",
 			"-look_ahead", "0",
+			"-adaptive_i", "1",
+			"-adaptive_b", "1",
 		}
 	case "amf":
+		// lowlatency + balanced quality is a big step up from ultralowlatency
+		// while still keeping encode latency near zero on AMF ASIC.
 		enc = []string{
 			"-vf", "format=nv12",
 			"-c:v", "h264_amf",
-			"-usage", "ultralowlatency",
+			"-usage", "lowlatency",
+			"-quality", "balanced",
 			"-rc", "cbr",
 		}
 	default: // "x264" / "" — software fallback
+		x264Preset := cfg.X264Preset
+		if x264Preset == "" {
+			x264Preset = "superfast"
+		}
 		enc = []string{
 			"-vf", "format=yuv420p",
 			"-c:v", "libx264",
 			"-threads", "2",
-			"-preset", "ultrafast",
+			"-preset", x264Preset,
 			"-tune", "zerolatency",
 		}
 	}
 
 	return append(append(common, enc...), tail...)
+}
+
+// x264Preset returns the configured x264 preset, defaulting to "superfast".
+func x264Preset(cfg FFmpegConfig) string {
+	if cfg.X264Preset != "" {
+		return cfg.X264Preset
+	}
+	return "superfast"
 }
 
 // ProbeEncoder picks a hardware H.264 encoder when one actually works on this

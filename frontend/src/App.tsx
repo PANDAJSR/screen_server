@@ -184,6 +184,15 @@ function InputIcon() {
   );
 }
 
+function QualityIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <label className="toggleRow">
@@ -225,11 +234,16 @@ export function App() {
   const [clientCursorScreenPos, setClientCursorScreenPos] = useState({ x: 0, y: 0 });
   const [statusOpen, setStatusOpen] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
+  type QualityPreset = 'smooth' | 'balanced' | 'quality';
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>('balanced');
+  const [qualityOpen, setQualityOpen] = useState(false);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [touchEnabled, setTouchEnabled] = useState(true);
   const [roundTripMs, setRoundTripMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
   const [remoteKeysPressed, setRemoteKeysPressed] = useState<number[]>([]);
+  const [connectionMode, setConnectionMode] = useState<string>('—');
+  const iceServersRef = useRef<RTCIceServer[]>([{ urls: 'stun:stun.l.google.com:19302' }]);
 
   // ---- Screen latency detection (blue→red flash test) ----
   type LatencyState = 'idle' | 'waiting-blue' | 'waiting-red' | 'done';
@@ -241,8 +255,10 @@ export function App() {
 
   const statusButtonRef = useRef<HTMLButtonElement | null>(null);
   const inputButtonRef = useRef<HTMLButtonElement | null>(null);
+  const qualityButtonRef = useRef<HTMLButtonElement | null>(null);
   const statusPopoverRef = useRef<HTMLDivElement | null>(null);
   const inputPopoverRef = useRef<HTMLDivElement | null>(null);
+  const qualityPopoverRef = useRef<HTMLDivElement | null>(null);
 
   const prevFramesRef = useRef<number | null>(null);
   const prevTimeRef = useRef<number | null>(null);
@@ -568,7 +584,7 @@ export function App() {
       startedRef.current = true;
 
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        iceServers: iceServersRef.current,
       });
       pcRef.current = pc;
 
@@ -660,6 +676,7 @@ export function App() {
     let pingTimer: number | undefined;
     let statsTimer: number | undefined;
     let clockTimer: number | undefined;
+    let iceStatsTimer: number | undefined;
 
     const ws = createSignalingSocket(room);
     wsRef.current = ws;
@@ -690,6 +707,33 @@ export function App() {
         prevFramesRef.current = totalFrames;
       }, 1000);
 
+      // Poll ICE stats every 2s to detect connection mode (direct vs relay).
+      const pollIceMode = () => {
+        const pc = pcRef.current;
+        if (!pc || pc.connectionState === 'closed') return;
+        pc.getStats().then((stats) => {
+          let localCandidateId = '';
+          stats.forEach((r) => {
+            if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+              localCandidateId = r.localCandidateId;
+            }
+          });
+          if (!localCandidateId) return;
+          stats.forEach((r) => {
+            if (r.type === 'local-candidate' && r.id === localCandidateId) {
+              const ct: string = r.candidateType || '';
+              if (ct === 'relay') setConnectionMode('中继');
+              else if (ct === 'srflx') setConnectionMode('直连 (STUN)');
+              else if (ct === 'host') setConnectionMode('直连 (局域网)');
+              else if (ct === 'prflx') setConnectionMode('直连 (P2P)');
+            }
+          });
+        }).catch(() => undefined);
+      };
+      iceStatsTimer = window.setInterval(pollIceMode, 2000);
+      pollIceMode(); // fire once immediately after a short delay for ICE to settle
+      setTimeout(pollIceMode, 5000);
+
       clockTimer = window.setInterval(() => setClock(new Date()), 100);
     };
 
@@ -703,6 +747,12 @@ export function App() {
 
       if (message.type === 'welcome' && message.payload?.clientId) {
         setClientId(message.payload.clientId);
+        // Use ICE servers from the server config if provided, otherwise keep
+        // the default STUN-only fallback.
+        const payload = message.payload as { clientId: string; iceServers?: RTCIceServer[] };
+        if (payload.iceServers && payload.iceServers.length > 0) {
+          iceServersRef.current = payload.iceServers;
+        }
         try { await startPeer(); } catch { setState('error'); }
         return;
       }
@@ -754,8 +804,15 @@ export function App() {
 
     document.addEventListener('pointerlockchange', handlePointerLockChange);
     document.addEventListener('mousemove', handleMouseMoveRemote);
-    document.addEventListener('mousedown', handleMouseDown);
-    document.addEventListener('mouseup', handleMouseUp);
+    // Mouse click / scroll / contextmenu handlers attach to the video element so
+    // clicks on popovers, the icon bar, and other page chrome do not trigger
+    // remote mouse events on the controlled machine.
+    const videoEl = videoRef.current;
+    if (videoEl) {
+      videoEl.addEventListener('mousedown', handleMouseDown);
+      videoEl.addEventListener('mouseup', handleMouseUp);
+      videoEl.addEventListener('wheel', handleWheel, { passive: false });
+    }
     const handleBlur = () => {
       for (const keyCode of heldKeys) {
         sendInput('input-keyup', { keyCode });
@@ -763,12 +820,12 @@ export function App() {
       heldKeys.clear();
     };
     window.addEventListener('blur', handleBlur);
-
-    document.addEventListener('wheel', handleWheel, { passive: false });
     document.addEventListener('keydown', handleKeyDown);
     document.addEventListener('keyup', handleKeyUp);
-    document.addEventListener('click', handleDocumentClick);
-    document.addEventListener('contextmenu', handleContextMenu);
+    if (videoEl) {
+      videoEl.addEventListener('click', handleDocumentClick);
+      videoEl.addEventListener('contextmenu', handleContextMenu);
+    }
     document.addEventListener('touchstart', handleTouchStart, { passive: false });
     document.addEventListener('touchmove', handleTouchMove, { passive: false });
     document.addEventListener('touchend', handleTouchEnd);
@@ -778,23 +835,26 @@ export function App() {
       if (pingTimer !== undefined) window.clearInterval(pingTimer);
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (clockTimer !== undefined) window.clearInterval(clockTimer);
+      if (iceStatsTimer !== undefined) window.clearInterval(iceStatsTimer);
       if (latencyRafRef.current != null) cancelAnimationFrame(latencyRafRef.current);
       if (latencyTimeoutRef.current != null) clearTimeout(latencyTimeoutRef.current);
       if (document.pointerLockElement === videoRef.current) document.exitPointerLock();
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
       document.removeEventListener('mousemove', handleMouseMoveRemote);
-      document.removeEventListener('mousedown', handleMouseDown);
-      document.removeEventListener('mouseup', handleMouseUp);
-      document.removeEventListener('wheel', handleWheel);
       window.removeEventListener('blur', handleBlur);
+      if (videoRef.current) {
+        videoRef.current.removeEventListener('mousedown', handleMouseDown);
+        videoRef.current.removeEventListener('mouseup', handleMouseUp);
+        videoRef.current.removeEventListener('wheel', handleWheel);
+        videoRef.current.removeEventListener('click', handleDocumentClick);
+        videoRef.current.removeEventListener('contextmenu', handleContextMenu);
+      }
       for (const keyCode of heldKeys) {
         sendInput('input-keyup', { keyCode });
       }
       heldKeys.clear();
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('keyup', handleKeyUp);
-      document.removeEventListener('click', handleDocumentClick);
-      document.removeEventListener('contextmenu', handleContextMenu);
       document.removeEventListener('touchstart', handleTouchStart);
       document.removeEventListener('touchmove', handleTouchMove);
       document.removeEventListener('touchend', handleTouchEnd);
@@ -866,10 +926,18 @@ export function App() {
       ) {
         setInputMenuOpen(false);
       }
+      if (
+        qualityOpen &&
+        qualityPopoverRef.current && qualityButtonRef.current &&
+        !qualityPopoverRef.current.contains(e.target as Node) &&
+        !qualityButtonRef.current.contains(e.target as Node)
+      ) {
+        setQualityOpen(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [statusOpen, inputMenuOpen]);
+  }, [statusOpen, inputMenuOpen, qualityOpen]);
 
   const reconnect = () => {
     if (document.pointerLockElement === videoRef.current) {
@@ -877,6 +945,7 @@ export function App() {
     }
     setStatusOpen(false);
     setInputMenuOpen(false);
+    setQualityOpen(false);
     setConnectionKey((k) => k + 1);
   };
 
@@ -1025,6 +1094,9 @@ export function App() {
         <button ref={inputButtonRef} className={`iconButtonWrap ${inputMenuOpen ? 'active' : ''}`} title="输入映射" onClick={() => setInputMenuOpen((o) => !o)}>
           <InputIcon />
         </button>
+        <button ref={qualityButtonRef} className={`iconButtonWrap ${qualityOpen ? 'active' : ''}`} title="画质设置" onClick={() => setQualityOpen((o) => !o)}>
+          <QualityIcon />
+        </button>
       </section>
 
       {statusOpen && (
@@ -1035,6 +1107,7 @@ export function App() {
             <div><dt>客户端 ID</dt><dd>{clientId || '等待中'}</dd></div>
             <div><dt>对等连接</dt><dd>{pcState}</dd></div>
             <div><dt>ICE 状态</dt><dd>{iceState}</dd></div>
+            <div><dt>连接模式</dt><dd>{connectionMode}</dd></div>
             <div><dt>帧率</dt><dd>{fps !== null ? fps.toFixed(1) : '-'}</dd></div>
             <div><dt>延迟</dt><dd>{roundTripMs !== null ? `${roundTripMs.toFixed(1)} 毫秒` : '-'}</dd></div>
             <div><dt>视频</dt><dd>{videoStats}</dd></div>
@@ -1111,6 +1184,43 @@ export function App() {
                   ? '移动鼠标到视频上即可控制远程（光标在视频中渲染）'
                   : '移动鼠标到视频上即可控制远程'}
           </div>
+        </div>
+      )}
+
+      {qualityOpen && (
+        <div className="popover qualityPopover" ref={qualityPopoverRef}>
+          <h3>画质设置</h3>
+          {(['smooth', 'balanced', 'quality'] as QualityPreset[]).map((preset) => {
+            const labels: Record<QualityPreset, { title: string; desc: string }> = {
+              smooth: { title: '流畅优先', desc: '低码率 · 最低延迟 · 适合弱网' },
+              balanced: { title: '均衡', desc: '中等码率 · 兼顾画质与延迟' },
+              quality: { title: '画质优先', desc: '高码率 · 最佳画质 · 适合局域网' },
+            };
+            const info = labels[preset];
+            return (
+              <label
+                key={preset}
+                className={`presetOption ${qualityPreset === preset ? 'presetOption--selected' : ''}`}
+              >
+                <input
+                  type="radio"
+                  name="qualityPreset"
+                  value={preset}
+                  checked={qualityPreset === preset}
+                  onChange={() => {
+                    setQualityPreset(preset);
+                    const ws = wsRef.current;
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                      ws.send(JSON.stringify({ type: 'quality-preset', payload: { preset } }));
+                      console.log('quality-preset sent:', preset);
+                    }
+                  }}
+                />
+                <span className="presetTitle">{info.title}</span>
+                <span className="presetDesc">{info.desc}</span>
+              </label>
+            );
+          })}
         </div>
       )}
 

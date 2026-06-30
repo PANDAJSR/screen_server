@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,12 +13,20 @@ import (
 
 	"screen_server/internal/rtc"
 	"screen_server/internal/signaling"
+
+	"github.com/pion/webrtc/v4"
 )
+
+// serverConfig mirrors the JSON config file.
+type serverConfig struct {
+	ICEServers []rtc.ICEServerConfig `json:"iceServers"`
+}
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	staticDir := flag.String("static", "./frontend/dist", "directory for built frontend assets")
 	logDir := flag.String("logdir", "./logs", "directory for log files")
+	configPath := flag.String("config", "./server-config.json", "path to server config JSON")
 	flag.Parse()
 
 	// Ensure log directory exists.
@@ -40,12 +49,22 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "logging to %s\n", logName)
 
-	rtcManager, err := rtc.NewManager()
+	// ---- Load ICE server config ----
+	iceServers := loadICEServers(*configPath)
+
+	rtcManager, err := rtc.NewManager(iceServers)
 	if err != nil {
 		log.Fatalf("create rtc manager: %v", err)
 	}
 
-	hub, err := signaling.NewHub(rtcManager)
+	// Marshal the public ICE config (includes credentials for the signaling
+	// channel) so the hub can relay it to browsers on join.
+	iceConfigJSON, err := json.Marshal(rtcManager.GetICEServers())
+	if err != nil {
+		log.Fatalf("marshal ice config: %v", err)
+	}
+
+	hub, err := signaling.NewHub(rtcManager, iceConfigJSON)
 	if err != nil {
 		log.Fatalf("create signaling hub: %v", err)
 	}
@@ -72,6 +91,47 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+// loadICEServers reads the config file and converts to pion webrtc.ICEServer.
+// Falls back to a public STUN-only config if the file is missing or invalid.
+func loadICEServers(path string) []webrtc.ICEServer {
+	defaultServers := []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.l.google.com:19302"}},
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("config file %s not found, using default STUN-only ICE config: %v", path, err)
+		return defaultServers
+	}
+
+	var cfg serverConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("config file %s parse error, using default STUN-only: %v", path, err)
+		return defaultServers
+	}
+
+	if len(cfg.ICEServers) == 0 {
+		log.Printf("config file %s has no iceServers, using default STUN-only", path)
+		return defaultServers
+	}
+
+	servers := make([]webrtc.ICEServer, 0, len(cfg.ICEServers))
+	for _, s := range cfg.ICEServers {
+		servers = append(servers, webrtc.ICEServer{
+			URLs:       s.URLs,
+			Username:   s.Username,
+			Credential: s.Credential,
+		})
+	}
+
+	var urls []string
+	for _, s := range servers {
+		urls = append(urls, s.URLs...)
+	}
+	log.Printf("loaded ICE servers from %s: %v", path, urls)
+	return servers
 }
 
 func logRequests(next http.Handler) http.Handler {

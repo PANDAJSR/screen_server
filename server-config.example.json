@@ -1,0 +1,12 @@
+{
+  "iceServers": [
+    {
+      "urls": ["stun:stun.l.google.com:19302"]
+    },
+    {
+      "urls": ["turn:你的服务器IP:3479?transport=udp"],
+      "username": "用户名",
+      "credential": "密码"
+    }
+  ]
+}

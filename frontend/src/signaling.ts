@@ -10,6 +10,7 @@ export type SignalType =
   | 'candidate'
   | 'error'
   | 'input-mode'
+  | 'quality-preset'
   | 'input-mousemove'
   | 'input-mousemove-abs'
   | 'input-mousebtn'

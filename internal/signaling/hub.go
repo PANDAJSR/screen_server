@@ -31,6 +31,7 @@ type Hub struct {
 	handler    ServerHandler
 	inputCtrl  input.Controller
 	latencyCtl latency.Controller
+	iceConfig  json.RawMessage
 }
 
 type inboundMessage struct {
@@ -38,7 +39,7 @@ type inboundMessage struct {
 	message Message
 }
 
-func NewHub(handler ServerHandler) (*Hub, error) {
+func NewHub(handler ServerHandler, iceConfig json.RawMessage) (*Hub, error) {
 	inputCtrl, err := input.NewController()
 	if err != nil {
 		log.Printf("input controller not available: %v", err)
@@ -57,6 +58,7 @@ func NewHub(handler ServerHandler) (*Hub, error) {
 		handler:    handler,
 		inputCtrl:  inputCtrl,
 		latencyCtl: latencyCtl,
+		iceConfig:  iceConfig,
 	}
 
 	if inputCtrl != nil {
@@ -76,14 +78,20 @@ func (h *Hub) Run() {
 				h.rooms[client.room] = make(map[*Client]bool)
 			}
 			h.rooms[client.room][client] = true
+			welcomePayload, _ := json.Marshal(struct {
+				ClientID string          `json:"clientId"`
+				Room     string          `json:"room"`
+				ICE      json.RawMessage `json:"iceServers"`
+			}{
+				ClientID: client.id,
+				Room:     client.room,
+				ICE:      h.iceConfig,
+			})
 			client.sendJSON(Message{
-				Type: MessageTypeWelcome,
-				Room: client.room,
-				To:   client.id,
-				Payload: mustJSON(map[string]string{
-					"clientId": client.id,
-					"room":     client.room,
-				}),
+				Type:    MessageTypeWelcome,
+				Room:    client.room,
+				To:      client.id,
+				Payload: welcomePayload,
 			})
 
 			if h.inputCtrl != nil {
@@ -158,7 +166,7 @@ func (h *Hub) Run() {
 				})
 				continue
 			}
-			if h.handler != nil && (msg.Type == MessageTypeOffer || msg.Type == MessageTypeCandidate || msg.Type == MessageTypeInputMode) {
+			if h.handler != nil && (msg.Type == MessageTypeOffer || msg.Type == MessageTypeCandidate || msg.Type == MessageTypeInputMode || msg.Type == MessageTypeQualityPreset) {
 				signal := ServerSignal{
 					ClientID: inbound.client.id,
 					Room:     inbound.client.room,

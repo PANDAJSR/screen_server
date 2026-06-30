@@ -24,9 +24,9 @@ import (
 const (
 	videoTrackID     = "screen"
 	videoStreamID    = "desktop"
-	videoFrameBuffer = 1
-	maxQueuedLatency = 33 * time.Millisecond
-	statsLogEvery   = 60 // frames between per-second aggregate timing logs (60fps → 1s)
+	videoFrameBuffer = 4                       // 4 frames = 133ms at 30fps; absorbs startup & WebRTC jitter
+	maxQueuedLatency = 150 * time.Millisecond  // 5 frames = 166ms; restart only on real backpressure
+	statsLogEvery    = 60                      // frames between per-second aggregate timing logs
 )
 
 // timedFrame wraps an encoded frame with the timing metadata needed to
@@ -41,19 +41,20 @@ type timedFrame struct {
 type Manager struct {
 	api           *webrtc.API
 	captureCfg    capture.FFmpegConfig
+	iceServers    []webrtc.ICEServer
 	mu            sync.Mutex
 	sessions      map[string]*Session
 	pendingICE    map[string][]webrtc.ICECandidateInit
 	maxPendingICE int
 }
 
-func NewManager() (*Manager, error) {
+func NewManager(iceServers []webrtc.ICEServer) (*Manager, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640029",
 		},
 		PayloadType: 102,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -82,8 +83,32 @@ func NewManager() (*Manager, error) {
 	if fps := os.Getenv("SCREEN_SERVER_CAPTURE_FPS"); fps != "" {
 		if parsed, err := strconv.Atoi(fps); err == nil && parsed > 0 {
 			captureCfg.FPS = parsed
-			captureCfg.GOP = max(1, parsed/4)
+			// GOP will be recomputed below unless explicitly overridden.
 		}
+	}
+
+	// Quality overrides — higher defaults than before, zero latency impact.
+	if br := os.Getenv("SCREEN_SERVER_BITRATE"); br != "" {
+		captureCfg.Bitrate = br
+	}
+	if mr := os.Getenv("SCREEN_SERVER_MAXRATE"); mr != "" {
+		captureCfg.MaxRate = mr
+	}
+	if bs := os.Getenv("SCREEN_SERVER_BUFSIZE"); bs != "" {
+		captureCfg.BufferSize = bs
+	}
+	if profile := os.Getenv("SCREEN_SERVER_PROFILE"); profile != "" {
+		captureCfg.Profile = profile
+	}
+
+	// GOP: explicit override wins; otherwise 2×FPS gives a 2-second keyframe
+	// interval which is fine for LAN packet loss and much more bitrate-efficient.
+	if gop := os.Getenv("SCREEN_SERVER_GOP"); gop != "" {
+		if parsed, err := strconv.Atoi(gop); err == nil && parsed > 0 {
+			captureCfg.GOP = parsed
+		}
+	} else {
+		captureCfg.GOP = max(1, captureCfg.FPS*2)
 	}
 
 	// Hardware encoding on Windows cuts the encode-stage latency and CPU load
@@ -99,10 +124,34 @@ func NewManager() (*Manager, error) {
 			webrtc.WithInterceptorRegistry(interceptors),
 		),
 		captureCfg:    captureCfg,
+		iceServers:    iceServers,
 		sessions:      make(map[string]*Session),
 		pendingICE:    make(map[string][]webrtc.ICECandidateInit),
 		maxPendingICE: 32,
 	}, nil
+}
+
+// ICEServerConfig is the JSON-serialisable form of ICE server config, used to
+// relay credentials to the browser via the signaling channel.
+type ICEServerConfig struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// GetICEServers returns the configured ICE servers in a form safe to send to the
+// browser (credentials included, since this runs on a private signaling channel).
+func (m *Manager) GetICEServers() []ICEServerConfig {
+	out := make([]ICEServerConfig, 0, len(m.iceServers))
+	for _, s := range m.iceServers {
+		cred, _ := s.Credential.(string)
+		out = append(out, ICEServerConfig{
+			URLs:       s.URLs,
+			Username:   s.Username,
+			Credential: cred,
+		})
+	}
+	return out
 }
 
 func (m *Manager) OnSignal(ctx context.Context, signal signaling.ServerSignal) {
@@ -121,6 +170,8 @@ func (m *Manager) OnSignal(ctx context.Context, signal signaling.ServerSignal) {
 		}
 	case signaling.MessageTypeInputMode:
 		m.handleInputMode(signal)
+	case signaling.MessageTypeQualityPreset:
+		m.handleQualityPreset(signal)
 	}
 }
 
@@ -146,6 +197,73 @@ func (m *Manager) handleInputMode(signal signaling.ServerSignal) {
 	log.Printf("input-mode client=%s cursorMode=%s drawMouse=%v", signal.ClientID, payload.CursorMode, cfg.DrawMouse)
 
 	// Non-blocking send to trigger capture restart
+	select {
+	case session.restartCh <- cfg:
+	default:
+		log.Printf("restart already pending for client=%s", signal.ClientID)
+	}
+}
+
+// qualityPresets maps preset names to FFmpegConfig overrides.
+var qualityPresets = map[string]struct {
+	Bitrate, MaxRate, BufferSize string
+	Profile                      string
+	GOPFactor                    float64 // multiply by FPS; 0 means "keep current"
+	NvencPreset, X264Preset      string
+}{
+	"smooth": {
+		Bitrate: "8M", MaxRate: "12M", BufferSize: "1M",
+		Profile: "baseline", GOPFactor: 0.5,
+		NvencPreset: "p1", X264Preset: "ultrafast",
+	},
+	"balanced": {
+		Bitrate: "20M", MaxRate: "30M", BufferSize: "10M",
+		Profile: "high", GOPFactor: 2,
+		NvencPreset: "p2", X264Preset: "superfast",
+	},
+	"quality": {
+		Bitrate: "30M", MaxRate: "40M", BufferSize: "20M",
+		Profile: "high", GOPFactor: 3,
+		NvencPreset: "p4", X264Preset: "veryfast",
+	},
+}
+
+func (m *Manager) handleQualityPreset(signal signaling.ServerSignal) {
+	var payload struct {
+		Preset string `json:"preset"`
+	}
+	if err := json.Unmarshal(signal.Message.Payload, &payload); err != nil {
+		log.Printf("quality-preset parse error client=%s err=%v", signal.ClientID, err)
+		return
+	}
+
+	p, ok := qualityPresets[payload.Preset]
+	if !ok {
+		log.Printf("quality-preset unknown preset=%q client=%s", payload.Preset, signal.ClientID)
+		return
+	}
+
+	m.mu.Lock()
+	session := m.sessions[signal.ClientID]
+	m.mu.Unlock()
+	if session == nil {
+		return
+	}
+
+	cfg := m.captureCfg
+	cfg.Bitrate = p.Bitrate
+	cfg.MaxRate = p.MaxRate
+	cfg.BufferSize = p.BufferSize
+	cfg.Profile = p.Profile
+	if p.GOPFactor > 0 {
+		cfg.GOP = max(1, int(float64(cfg.FPS)*p.GOPFactor))
+	}
+	cfg.NvencPreset = p.NvencPreset
+	cfg.X264Preset = p.X264Preset
+
+	log.Printf("quality-preset client=%s preset=%s bitrate=%s profile=%s gop=%d nvenc=%s x264=%s",
+		signal.ClientID, payload.Preset, cfg.Bitrate, cfg.Profile, cfg.GOP, cfg.NvencPreset, cfg.X264Preset)
+
 	select {
 	case session.restartCh <- cfg:
 	default:
@@ -274,9 +392,7 @@ type Session struct {
 
 func (m *Manager) newSession(clientID, room string, send func(signaling.Message)) (*Session, error) {
 	pc, err := m.api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
+		ICEServers: m.iceServers,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create peer connection: %w", err)
@@ -285,7 +401,7 @@ func (m *Manager) newSession(clientID, room string, send func(signaling.Message)
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
 		ClockRate:   90000,
-		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640029",
 	}, videoTrackID, videoStreamID)
 	if err != nil {
 		_ = pc.Close()

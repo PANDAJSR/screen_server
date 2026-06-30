@@ -390,3 +390,44 @@ p {
     top: 52px;
   }
 }
+
+/* ---- Quality preset popover ---- */
+
+.qualityPopover {
+  display: grid;
+  gap: 8px;
+}
+
+.presetOption {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid #dbe2ec;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.presetOption--selected {
+  border-color: #1f9d55;
+  background: #f0faf4;
+}
+
+.presetOption input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.presetTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.presetDesc {
+  font-size: 12px;
+  color: #8b95a5;
+}
