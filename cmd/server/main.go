@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"screen_server/internal/rtc"
@@ -50,10 +51,22 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "logging to %s\n", logName)
 
+	// ---- Frame dump for debugging ----
+	dumpFrames := false
+	var dumpDir string
+	if dv := strings.ToLower(strings.TrimSpace(os.Getenv("SCREEN_SERVER_DUMP_FRAMES"))); dv == "1" || dv == "true" {
+		dumpFrames = true
+		dumpDir = filepath.Join(*logDir, "frames_"+time.Now().Format("2006-01-02_150405"))
+		if err := os.MkdirAll(dumpDir, 0755); err != nil {
+			log.Fatalf("create frame dump dir: %v", err)
+		}
+		log.Printf("frame dump enabled, saving to %s", dumpDir)
+	}
+
 	// ---- Load ICE server config ----
 	iceServers := loadICEServers(*configPath)
 
-	rtcManager, err := rtc.NewManager(iceServers)
+	rtcManager, err := rtc.NewManager(iceServers, dumpFrames, dumpDir)
 	if err != nil {
 		log.Fatalf("create rtc manager: %v", err)
 	}

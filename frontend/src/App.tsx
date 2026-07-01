@@ -1310,7 +1310,7 @@ export function App() {
         setScreenSize({ width: size.width, height: size.height });
       } else if (message.type === 'capture-region' && message.payload) {
         const region = message.payload as CaptureRegion;
-        console.debug('capture-region received', JSON.stringify(region));
+        logger.info('capture-region received', region);
         setCaptureRegion(region);
       } else if (message.type === 'input-key-state' && message.payload) {
         setRemoteKeysPressed(message.payload as number[]);
@@ -1514,11 +1514,13 @@ export function App() {
     fetch('/api/displays').then(r => r.json()).then(setDisplays).catch(console.error);
     fetch('/api/windows').then(r => r.json()).then(data => {
       setWindows(data);
+      logger.info('windows list fetched', { count: data?.length, titles: data?.map((w: { title: string }) => w.title) });
       // Auto-select first window if in window mode with no title.
       if (captureMode === 'window' && !selectedWindowTitle && data && data.length > 0) {
+        logger.info('auto-selecting first window', { title: data[0].title });
         setSelectedWindowTitle(data[0].title);
       }
-    }).catch(console.error);
+    }).catch(err => { logger.error('fetch windows failed', err); console.error(err); });
   }, [captureSettingsOpen]);
 
   const sendCaptureSettings = (
@@ -1526,11 +1528,14 @@ export function App() {
     windowTitle: string, transpBg: WindowTransparencyBg,
   ) => {
     const ws = wsRef.current;
+    logger.info('capture-settings sending', { mode, displayIdx, windowTitle, transpBg, sessionId: sid });
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: 'capture-settings',
         payload: { sessionId: sid, captureMode: mode, displayIndex: displayIdx, windowTitle, windowTransparencyBg: transpBg },
       }));
+    } else {
+      logger.warn('capture-settings: WebSocket not open', { readyState: ws?.readyState });
     }
   };
 
@@ -1908,12 +1913,14 @@ export function App() {
                   checked={captureMode === opt.value}
                   onChange={() => {
                     setCaptureMode(opt.value);
+                    logger.info('capture mode changed', { from: captureMode, to: opt.value });
                     // Auto-select first window when switching to window mode with no title set.
                     let winTitle = selectedWindowTitle;
                     let transpBg = windowTransparencyBg;
                     if (opt.value === 'window' && !winTitle && windows.length > 0) {
                       winTitle = windows[0].title;
                       setSelectedWindowTitle(winTitle);
+                      logger.info('auto-selected window on mode switch', { title: winTitle });
                     }
                     sendCaptureSettings(sessionId, opt.value, selectedDisplayIndex, winTitle, transpBg);
                   }} />
@@ -1948,6 +1955,7 @@ export function App() {
                 <select className="cursorModeSelect" value={selectedWindowTitle}
                   onChange={(e) => {
                     const title = e.target.value;
+                    logger.info('window selected', { title, previousTitle: selectedWindowTitle });
                     setSelectedWindowTitle(title);
                     sendCaptureSettings(sessionId, captureMode, selectedDisplayIndex, title, windowTransparencyBg);
                   }}>

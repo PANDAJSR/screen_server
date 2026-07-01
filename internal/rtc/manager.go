@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -47,9 +48,11 @@ type Manager struct {
 	sessions      map[string]*Session
 	pendingICE    map[string][]webrtc.ICECandidateInit
 	maxPendingICE int
+	dumpFrames    bool
+	dumpDir       string
 }
 
-func NewManager(iceServers []webrtc.ICEServer) (*Manager, error) {
+func NewManager(iceServers []webrtc.ICEServer, dumpFrames bool, dumpDir string) (*Manager, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -129,6 +132,8 @@ func NewManager(iceServers []webrtc.ICEServer) (*Manager, error) {
 		sessions:      make(map[string]*Session),
 		pendingICE:    make(map[string][]webrtc.ICECandidateInit),
 		maxPendingICE: 32,
+		dumpFrames:    dumpFrames,
+		dumpDir:       dumpDir,
 	}, nil
 }
 
@@ -283,41 +288,86 @@ func (m *Manager) handleCaptureSettings(signal signaling.ServerSignal) {
 		WindowTransparencyBg string `json:"windowTransparencyBg"`
 	}
 	if err := json.Unmarshal(signal.Message.Payload, &payload); err != nil {
-		log.Printf("capture-settings parse error client=%s err=%v", signal.ClientID, err)
+		log.Printf("[capture] parse error client=%s err=%v", signal.ClientID, err)
 		return
 	}
+
+	log.Printf("[capture] settings-request client=%s mode=%s displayIdx=%d window=%q transp=%q sessionId=%d",
+		signal.ClientID, payload.CaptureMode, payload.DisplayIndex, payload.WindowTitle,
+		payload.WindowTransparencyBg, payload.SessionID)
 
 	m.mu.Lock()
 	session := m.sessions[signal.ClientID]
 	m.mu.Unlock()
 	if session == nil {
+		log.Printf("[capture] no session for client=%s, ignoring settings", signal.ClientID)
 		return
 	}
 
+	oldCfg := m.captureCfg
 	cfg := m.captureCfg.Clone()
 	cfg.CaptureMode = payload.CaptureMode
 	cfg.WindowTitle = payload.WindowTitle
 	cfg.WindowTransparencyBg = payload.WindowTransparencyBg
 
+	// Log the state transition.
+	log.Printf("[capture] state-transition client=%s oldMode=%s oldWindow=%q oldTransp=%q → newMode=%s newWindow=%q newTransp=%q",
+		signal.ClientID, oldCfg.CaptureMode, oldCfg.WindowTitle, oldCfg.WindowTransparencyBg,
+		cfg.CaptureMode, cfg.WindowTitle, cfg.WindowTransparencyBg)
+
 	// Reject window mode with empty title — ffmpeg would fail and freeze.
 	if payload.CaptureMode == "window" && payload.WindowTitle == "" {
-		log.Printf("capture-settings client=%s mode=window rejected: empty window title", signal.ClientID)
+		log.Printf("[capture] settings-rejected client=%s mode=window reason=\"empty window title\"", signal.ClientID)
 		return
 	}
 
 	// Resolve display offset/size for display mode.
 	if payload.CaptureMode == "display" {
 		displays, err := sysinfo.EnumDisplays()
-		if err == nil && payload.DisplayIndex >= 0 && payload.DisplayIndex < len(displays) {
+		if err != nil {
+			log.Printf("[capture] enum-displays-failed client=%s err=%v", signal.ClientID, err)
+		} else if payload.DisplayIndex >= 0 && payload.DisplayIndex < len(displays) {
 			d := displays[payload.DisplayIndex]
 			cfg.DisplayOffsetX = d.X
 			cfg.DisplayOffsetY = d.Y
 			cfg.DisplayWidth = d.Width
 			cfg.DisplayHeight = d.Height
+			log.Printf("[capture] display-resolved client=%s index=%d name=%q offset=(%d,%d) size=%dx%d primary=%v",
+				signal.ClientID, payload.DisplayIndex, d.Name, d.X, d.Y, d.Width, d.Height, d.Primary)
+		} else {
+			log.Printf("[capture] display-index-oob client=%s index=%d numDisplays=%d", signal.ClientID, payload.DisplayIndex, len(displays))
 		}
 	}
 
-	log.Printf("capture-settings client=%s mode=%s displayIdx=%d window=%q transp=%q offset=%d,%d size=%dx%d",
+	// Validate window exists on screen for window mode.
+	if cfg.CaptureMode == "window" && cfg.WindowTitle != "" {
+		x, y, w, h, found := sysinfo.GetWindowRectByTitle(cfg.WindowTitle)
+		if found {
+			log.Printf("[capture] window-found client=%s title=%q rect=(%d,%d %dx%d)",
+				signal.ClientID, cfg.WindowTitle, x, y, w, h)
+			// Reject minimized or too-small windows: Windows reports minimized
+			// windows at (-32000,-32000) with 0×0 size. gdigrab will fail
+			// with "Invalid properties, aborting" which kills the pipe and the
+			// session. Also reject windows below NVENC minimum 64×64
+			// resolution — the encoder fails with "Frame Dimension less than
+			// the minimum" and crashes the session.
+			if (w == 0 || h == 0) {
+				log.Printf("[capture] settings-rejected client=%s mode=window title=%q reason=\"window is minimized (0x0 rect), restore it first\"",
+					signal.ClientID, cfg.WindowTitle)
+				return
+			}
+			if (w < 64 || h < 64) {
+				log.Printf("[capture] settings-rejected client=%s mode=window title=%q reason=\"window size %dx%d below minimum 64x64 (likely minimized or offscreen), restore it first\"",
+					signal.ClientID, cfg.WindowTitle, w, h)
+				return
+			}
+		} else {
+			log.Printf("[capture] window-not-found client=%s title=%q — capture may fail or produce blank frames",
+				signal.ClientID, cfg.WindowTitle)
+		}
+	}
+
+	log.Printf("[capture] settings-applied client=%s mode=%s displayIdx=%d window=%q transp=%q offset=%d,%d size=%dx%d",
 		signal.ClientID, cfg.CaptureMode, payload.DisplayIndex, cfg.WindowTitle,
 		cfg.WindowTransparencyBg, cfg.DisplayOffsetX, cfg.DisplayOffsetY,
 		cfg.DisplayWidth, cfg.DisplayHeight)
@@ -328,6 +378,7 @@ func (m *Manager) handleCaptureSettings(signal signaling.ServerSignal) {
 	// Manage window-position polling so input mapping stays correct when the
 	// user drags the captured window.
 	if cfg.CaptureMode == "window" && cfg.WindowTitle != "" {
+		log.Printf("[capture] start-window-poll client=%s window=%q", signal.ClientID, cfg.WindowTitle)
 		m.startWindowPoll(session, cfg.WindowTitle)
 	} else {
 		m.stopWindowPoll(session)
@@ -337,13 +388,19 @@ func (m *Manager) handleCaptureSettings(signal signaling.ServerSignal) {
 	// Use non-blocking send so a dead capture pipe (readFrames exited due to
 	// ffmpeg error) doesn't hang the handler goroutine.
 	select {
-	case <-session.restartCh:
+	case old := <-session.restartCh:
+		log.Printf("[capture] drained-stale-restart client=%s oldMode=%s oldWindow=%q", signal.ClientID, old.CaptureMode, old.WindowTitle)
 	default:
 	}
 	select {
 	case session.restartCh <- cfg:
+		log.Printf("[capture] restart-queued client=%s mode=%s window=%q", signal.ClientID, cfg.CaptureMode, cfg.WindowTitle)
+		// Update the manager-level config so the next handleCaptureSettings call
+		// sees the correct "old" state in its state-transition log.
+		m.captureCfg = cfg
 	default:
-		log.Printf("capture restart failed client=%s: channel full or capture dead", signal.ClientID)
+		log.Printf("[capture] restart-failed client=%s reason=\"channel full or capture dead\" mode=%s window=%q",
+			signal.ClientID, cfg.CaptureMode, cfg.WindowTitle)
 	}
 }
 
@@ -383,7 +440,7 @@ func (m *Manager) sendCaptureRegion(session *Session, cfg capture.FFmpegConfig) 
 	}
 
 	vOriginX, vOriginY := sysinfo.GetVirtualScreenOrigin()
-	log.Printf("capture-region client=%s mode=%s region=(%d,%d %dx%d) virtualOrigin=(%d,%d)",
+	log.Printf("[capture] region-sent client=%s mode=%s region=(%d,%d %dx%d) virtualOrigin=(%d,%d)",
 		session.clientID, cfg.CaptureMode, offsetX, offsetY, width, height, vOriginX, vOriginY)
 
 	session.send(signaling.Message{
@@ -572,6 +629,7 @@ type Session struct {
 	statReadUs  int64
 	statQueueUs int64
 	statWriteUs int64
+	dumpWriter  *os.File
 }
 
 func (m *Manager) newSession(clientID, room string, send func(signaling.Message)) (*Session, error) {
@@ -599,6 +657,17 @@ func (m *Manager) newSession(clientID, room string, send func(signaling.Message)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var dumpWriter *os.File
+	if m.dumpFrames && m.dumpDir != "" {
+		dumpPath := filepath.Join(m.dumpDir, clientID+".h264")
+		var err error
+		dumpWriter, err = os.Create(dumpPath)
+		if err != nil {
+			log.Printf("[dump] create file failed client=%s path=%s err=%v", clientID, dumpPath, err)
+		} else {
+			log.Printf("[dump] saving frames to %s", dumpPath)
+		}
+	}
 	session := &Session{
 		clientID:  clientID,
 		room:      room,
@@ -610,6 +679,7 @@ func (m *Manager) newSession(clientID, room string, send func(signaling.Message)
 		cancel:    cancel,
 		done:      make(chan struct{}),
 		restartCh: make(chan capture.FFmpegConfig, 1),
+		dumpWriter: dumpWriter,
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -657,6 +727,7 @@ func (s *Session) Start(parent context.Context, cfg capture.FFmpegConfig) error 
 func (s *Session) Close() {
 	s.once.Do(func() {
 		s.cancel()
+		if s.dumpWriter != nil { s.dumpWriter.Close() }
 		_ = s.pc.Close()
 		close(s.done)
 	})
@@ -682,23 +753,38 @@ func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCap
 		// Check for restart requests (non-blocking)
 		select {
 		case newCfg := <-s.restartCh:
-			log.Printf("restarting capture for cursor mode change client=%s drawMouse=%v", s.clientID, newCfg.DrawMouse)
+			log.Printf("[capture] restart-begin client=%s oldMode=%s oldWindow=%q newMode=%s newWindow=%q newTransp=%q drawMouse=%v", s.clientID, cfg.CaptureMode, cfg.WindowTitle, newCfg.CaptureMode, newCfg.WindowTitle, newCfg.WindowTransparencyBg, newCfg.DrawMouse)
 			if err := stream.Stop(); err != nil {
-				log.Printf("stop capture for restart failed client=%s err=%v", s.clientID, err)
+				log.Printf("[capture] restart-stop-err client=%s err=%v", s.clientID, err)
 			}
 			for len(frames) > 0 {
 				<-frames
 			}
 			restarted, err := capture.StartFFmpegCapture(s.ctx, newCfg)
+			startedCfg := newCfg
 			if err != nil {
+				// FFmpeg can fail to start if the target window is minimized or
+				// otherwise invalid (e.g. gdigrab "Invalid properties, aborting").
+				// Instead of killing the session, fall back to the old config so
+				// the stream stays alive and the user can try another window.
 				if s.ctx.Err() == nil {
-					log.Printf("restart capture failed client=%s err=%v", s.clientID, err)
+					log.Printf("[capture] restart-start-failed client=%s newMode=%s newWindow=%q err=%v -- falling back to old config",
+						s.clientID, newCfg.CaptureMode, newCfg.WindowTitle, err)
 				}
-				return
+				restarted, err = capture.StartFFmpegCapture(s.ctx, cfg)
+				if err != nil {
+					if s.ctx.Err() == nil {
+						log.Printf("[capture] restart-fallback-failed client=%s err=%v", s.clientID, err)
+					}
+					return
+				}
+				startedCfg = cfg // fell back to old config
+				log.Printf("[capture] restart-fallback-ok client=%s oldMode=%s oldWindow=%q",
+					s.clientID, cfg.CaptureMode, cfg.WindowTitle)
 			}
 			stream = restarted
 			reader = stream.Reader()
-			cfg = newCfg
+			cfg = startedCfg
 			continue
 		default:
 		}
@@ -806,6 +892,18 @@ func (s *Session) writeFrames(frames <-chan timedFrame) {
 			written++
 			if tf.frame.IsKeyframe {
 				keyframes++
+			}
+
+			// ---- Dump frames to disk when enabled ----
+			// Every frame written to the WebRTC track is also appended to a
+			// continuous .h264 file. The file is playable with ffplay and lets
+			// you correlate log timestamps with what the client actually saw.
+			if s.dumpWriter != nil {
+				if _, werr := s.dumpWriter.Write(tf.frame.Data); werr != nil {
+					log.Printf("[dump] write failed client=%s err=%v", s.clientID, werr)
+					s.dumpWriter.Close()
+					s.dumpWriter = nil
+				}
 			}
 
 			// Accumulate per-second timing stats.

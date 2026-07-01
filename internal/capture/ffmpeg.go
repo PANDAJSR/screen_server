@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"screen_server/internal/sysinfo"
 )
 
 type FFmpegConfig struct {
@@ -174,6 +176,10 @@ func StartFFmpegCapture(ctx context.Context, cfg FFmpegConfig) (*FFmpegCapture, 
 		c.done <- err
 		close(c.done)
 	}()
+
+	log.Printf("[ffmpeg-start] mode=%s window=%q transp=%q input=%s fps=%d encoder=%s gop=%d bitrate=%s",
+		cfg.CaptureMode, cfg.WindowTitle, cfg.WindowTransparencyBg,
+		cfg.Input, cfg.FPS, cfg.Encoder, cfg.GOP, cfg.Bitrate)
 
 	return c, nil
 }
@@ -434,7 +440,15 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 
 	enc := buildEncoderArgs(cfg)
 
-	return append(append(common, enc...), tail...)
+	args := append(append(common, enc...), tail...)
+
+	// Log key capture parameters for debugging window/display switching.
+	log.Printf("[ffmpeg-args] mode=%s window=%q transp=%q offset=%d,%d size=%dx%d fps=%d encoder=%s gop=%d bitrate=%s args=%v",
+		cfg.CaptureMode, cfg.WindowTitle, cfg.WindowTransparencyBg,
+		cfg.DisplayOffsetX, cfg.DisplayOffsetY, cfg.DisplayWidth, cfg.DisplayHeight,
+		cfg.FPS, cfg.Encoder, cfg.GOP, cfg.Bitrate, args)
+
+	return args
 }
 
 // buildWindowsWindowTransparentArgs builds args for window capture with a solid
@@ -445,6 +459,16 @@ func buildWindowsWindowTransparentArgs(cfg FFmpegConfig, drawMouse, profile stri
 		bgColor = "white"
 	}
 	fps := fmt.Sprintf("%d", cfg.FPS)
+
+	// Determine the window size so the background matches exactly.
+	// gdigrab outputs the window at its native resolution; overlay at 0:0
+	// on a matching-size background avoids any clipping or misalignment.
+	winW, winH := 1920, 1080 // fallback if window rect lookup fails
+	if cfg.WindowTitle != "" {
+		if _, _, w, h, found := sysinfo.GetWindowRectByTitle(cfg.WindowTitle); found && w > 0 && h > 0 {
+			winW, winH = w, h
+		}
+	}
 
 	// Two inputs: [0] gdigrab window capture, [1] lavfi solid color.
 	// filter_complex overlays window onto solid background.
@@ -458,7 +482,7 @@ func buildWindowsWindowTransparentArgs(cfg FFmpegConfig, drawMouse, profile stri
 		"-draw_mouse", drawMouse,
 		"-i", fmt.Sprintf("title=%s", cfg.WindowTitle),
 		"-f", "lavfi",
-		"-i", fmt.Sprintf("color=c=%s:s=1920x1080:r=%s", bgColor, fps),
+		"-i", fmt.Sprintf("color=c=%s:s=%dx%d:r=%s", bgColor, winW, winH, fps),
 		"-an",
 		"-avioflags", "direct",
 	}
@@ -485,6 +509,10 @@ func buildWindowsWindowTransparentArgs(cfg FFmpegConfig, drawMouse, profile stri
 	// the filter_complex output pad is "[out]" which maps implicitly.
 	result := append(common, enc...)
 	result = append(result, tail...)
+
+	log.Printf("[ffmpeg-args] mode=window+transp window=%q transp=%q fps=%s encoder=%s gop=%d bitrate=%s args=%v",
+		cfg.WindowTitle, cfg.WindowTransparencyBg, fps, cfg.Encoder, cfg.GOP, cfg.Bitrate, result)
+
 	return result
 }
 
