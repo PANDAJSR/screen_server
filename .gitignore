@@ -20,3 +20,5 @@ server-config.json
 # Logs
 *.log
 .DS_Store
+
+logs/*
