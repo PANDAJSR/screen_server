@@ -125,11 +125,13 @@ function RemoteCursor({
   cursorPos,
   screenSize,
   cursorImage,
+  captureRegion,
 }: {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   cursorPos: { x: number; y: number };
   screenSize: { width: number; height: number };
   cursorImage: CursorImagePayload | null;
+  captureRegion: { offsetX: number; offsetY: number; width: number; height: number } | null;
 }) {
   const [position, setPosition] = useState({ x: 0, y: 0 });
 
@@ -139,8 +141,10 @@ function RemoteCursor({
       if (!video) return;
 
       const containerRect = video.getBoundingClientRect();
-      const videoWidth = video.videoWidth || screenSize.width;
-      const videoHeight = video.videoHeight || screenSize.height;
+      // Use capture-region dimensions when available; they are the ground truth
+      // for the video's intrinsic size and don't go stale on resolution changes.
+      const videoWidth = (captureRegion && captureRegion.width > 0) ? captureRegion.width : (video.videoWidth || screenSize.width);
+      const videoHeight = (captureRegion && captureRegion.height > 0) ? captureRegion.height : (video.videoHeight || screenSize.height);
 
       const containerAspect = containerRect.width / containerRect.height;
       const videoAspect = videoWidth / videoHeight;
@@ -158,8 +162,21 @@ function RemoteCursor({
         contentTop = containerRect.top + (containerRect.height - contentHeight) / 2;
       }
 
-      const percentX = cursorPos.x / screenSize.width;
-      const percentY = cursorPos.y / screenSize.height;
+      // Normalize cursor position relative to the capture region so the
+      // overlay is correct when viewing a sub-region (window/display mode).
+      // cursorPos from the server is in absolute screen coordinates;
+      // subtract the region offset and divide by region dimensions.
+      let percentX: number;
+      let percentY: number;
+      if (captureRegion && captureRegion.width > 0 && captureRegion.height > 0 &&
+          (captureRegion.offsetX !== 0 || captureRegion.offsetY !== 0 ||
+           captureRegion.width !== screenSize.width || captureRegion.height !== screenSize.height)) {
+        percentX = (cursorPos.x - captureRegion.offsetX) / captureRegion.width;
+        percentY = (cursorPos.y - captureRegion.offsetY) / captureRegion.height;
+      } else {
+        percentX = cursorPos.x / screenSize.width;
+        percentY = cursorPos.y / screenSize.height;
+      }
 
       setPosition({
         x: contentLeft + percentX * contentWidth,
@@ -178,7 +195,7 @@ function RemoteCursor({
       clearInterval(interval);
       resizeObserver.disconnect();
     };
-  }, [videoRef, cursorPos, screenSize]);
+  }, [videoRef, cursorPos, screenSize, captureRegion]);
 
   return <CursorOverlay position={position} cursorImage={cursorImage} />;
 }
@@ -219,6 +236,16 @@ function QualityIcon() {
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
       <circle cx="12" cy="12" r="3" />
       <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CaptureSettingsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <rect x="2" y="3" width="20" height="14" rx="2" />
+      <path d="M8 21h8M12 17v4" />
+      <circle cx="12" cy="10" r="2" fill="currentColor" />
     </svg>
   );
 }
@@ -274,6 +301,22 @@ export function App() {
   type QualityPreset = 'smooth' | 'balanced' | 'quality';
   const [qualityPreset, setQualityPreset] = useState<QualityPreset>('balanced');
   const [qualityOpen, setQualityOpen] = useState(false);
+  type CaptureMode = 'desktop' | 'display' | 'window';
+  type WindowTransparencyBg = '' | 'black' | 'white';
+  const [captureSettingsOpen, setCaptureSettingsOpen] = useState(false);
+  const [captureMode, setCaptureMode] = useState<CaptureMode>('desktop');
+  const [selectedDisplayIndex, setSelectedDisplayIndex] = useState(0);
+  const [selectedWindowTitle, setSelectedWindowTitle] = useState('');
+  const [windowTransparencyBg, setWindowTransparencyBg] = useState<WindowTransparencyBg>('');
+  const [sessionId, setSessionId] = useState(0);
+  const [sessions, setSessions] = useState<{id:number;name:string;state:string;userName:string}[]>([]);
+  const [displays, setDisplays] = useState<{index:number;name:string;x:number;y:number;width:number;height:number;primary:boolean}[]>([]);
+  const [windows, setWindows] = useState<{title:string;class:string}[]>([]);
+  type CaptureRegion = { offsetX: number; offsetY: number; width: number; height: number } | null;
+  const [captureRegion, setCaptureRegion] = useState<CaptureRegion>(null);
+  const captureRegionRef = useRef<CaptureRegion>(null);
+  const videoResizeHandlerRef = useRef<(() => void) | null>(null); // cleanup for video resize listener
+  const captureMapLogCount = useRef(0); // throttled log counter for capture-map
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [touchMode, setTouchMode] = useState<TouchMode>('multi-touch');
   const [dragMethods, setDragMethods] = useState<Set<DragMethod>>(new Set(['long-press']));
@@ -297,11 +340,14 @@ export function App() {
   const statusPopoverRef = useRef<HTMLDivElement | null>(null);
   const inputPopoverRef = useRef<HTMLDivElement | null>(null);
   const qualityPopoverRef = useRef<HTMLDivElement | null>(null);
+  const captureSettingsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const captureSettingsPopoverRef = useRef<HTMLDivElement | null>(null);
 
   const prevFramesRef = useRef<number | null>(null);
   const prevTimeRef = useRef<number | null>(null);
 
   cursorModeRef.current = cursorMode;
+  captureRegionRef.current = captureRegion;
   touchModeRef.current = touchMode;
   dragMethodsRef.current = dragMethods;
 
@@ -315,14 +361,19 @@ export function App() {
 
   // ---- Coordinate mapping helpers ----
 
-  /** Get the letterboxed content rect for the video element. Returns null if video not ready. */
+  /** Get the letterboxed content rect for the video element. Returns null if video not ready.
+   *  When a capture-region is active, its width/height are the ground truth from
+   *  the server and are used in preference to video.videoWidth, which may not
+   *  update correctly when WebRTC resolution changes in-band (e.g. desktop →
+   *  window capture restart). */
   function getContentRect(): { left: number; top: number; width: number; height: number } | null {
     const video = videoRef.current;
     if (!video) return null;
 
     const containerRect = video.getBoundingClientRect();
-    const videoWidth = video.videoWidth || screenSize.width;
-    const videoHeight = video.videoHeight || screenSize.height;
+    const region = captureRegionRef.current;
+    const videoWidth = (region && region.width > 0) ? region.width : (video.videoWidth || screenSize.width);
+    const videoHeight = (region && region.height > 0) ? region.height : (video.videoHeight || screenSize.height);
 
     const containerAspect = containerRect.width / containerRect.height;
     const videoAspect = videoWidth / videoHeight;
@@ -343,24 +394,51 @@ export function App() {
   }
 
   /** Map a clientX/clientY (viewport pixels) to remote screen coordinates. Returns null if outside content area.
-   *  The output coordinate space is the VIDEO's intrinsic resolution (what gdigrab
-   *  captured and what SetCursorPos normalizes against) — NOT the separately
-   *  reported screenSize, which can disagree (e.g. 1080 vs actual 1200). */
+   *  When a capture-region is active (single display or window mode), coordinates
+   *  are offset so they map to the correct absolute screen position. */
   function mapClientToRemote(clientX: number, clientY: number): { x: number; y: number } | null {
     const video = videoRef.current;
     if (!video) return null;
-    // Authoritative remote dimensions = the decoded video frame size.
-    const remoteW = video.videoWidth || screenSize.width;
-    const remoteH = video.videoHeight || screenSize.height;
     const cr = getContentRect();
     if (!cr) return null;
     if (clientX < cr.left || clientX > cr.left + cr.width || clientY < cr.top || clientY > cr.top + cr.height) {
       return null;
     }
-    return {
-      x: Math.round(((clientX - cr.left) / cr.width) * remoteW),
-      y: Math.round(((clientY - cr.top) / cr.height) * remoteH),
-    };
+
+    // Use capture-region dimensions as ground truth — the server sends the
+    // exact capture area size. This avoids relying on video.videoWidth which
+    // can be stale after WebRTC in-band resolution changes (ffmpeg restart
+    // with different capture dimensions).
+    const region = captureRegionRef.current;
+    const remoteW = (region && region.width > 0) ? region.width : (video.videoWidth || screenSize.width);
+    const remoteH = (region && region.height > 0) ? region.height : (video.videoHeight || screenSize.height);
+
+    let x = Math.round(((clientX - cr.left) / cr.width) * remoteW);
+    let y = Math.round(((clientY - cr.top) / cr.height) * remoteH);
+
+    // Apply capture-region offset: when capturing a sub-region of the desktop
+    // (single display or window), video pixel (0,0) maps to screen (offsetX, offsetY).
+    // Since remoteW/remoteH already match the region dimensions, no scaling needed.
+    if (region && (region.offsetX !== 0 || region.offsetY !== 0)) {
+      x = region.offsetX + x;
+      y = region.offsetY + y;
+    }
+
+    // Throttled debug log: every ~120 calls (~2s at 60fps input)
+    captureMapLogCount.current++;
+    if (captureMapLogCount.current % 120 === 0 && region) {
+      console.debug('capture-map', {
+        clientX, clientY,
+        remoteW, remoteH,
+        videoX: Math.round(((clientX - cr.left) / cr.width) * remoteW),
+        videoY: Math.round(((clientY - cr.top) / cr.height) * remoteH),
+        region: JSON.stringify(region),
+        finalX: x, finalY: y,
+        screenSize: JSON.stringify(screenSize),
+      });
+    }
+
+    return { x, y };
   }
 
   /** Map clientX/clientY to the screen position where the cursor overlay should be rendered. */
@@ -1064,16 +1142,21 @@ export function App() {
           // captured desktop, so its intrinsic resolution trumps the server-
           // reported GetSystemMetrics value (which can be wrong under DPI
           // virtualization or multi-monitor setups).
-          const onMeta = () => {
+          // Listen for resize events to detect in-band resolution changes
+          // (e.g. desktop → window capture restart). loadedmetadata only
+          // fires once; resize fires whenever intrinsic dimensions change.
+          const onResize = () => {
             const v = videoRef.current;
             if (v && v.videoWidth > 0 && v.videoHeight > 0) {
               setScreenSize({ width: v.videoWidth, height: v.videoHeight });
             }
           };
-          videoRef.current.addEventListener('loadedmetadata', onMeta, { once: true });
+          videoRef.current.addEventListener('loadedmetadata', onResize, { once: true });
+          videoRef.current.addEventListener('resize', onResize);
+          videoResizeHandlerRef.current = onResize;
           videoRef.current.srcObject = stream;
           // If metadata already loaded (e.g. reconnection), apply immediately.
-          if (videoRef.current.videoWidth > 0) onMeta();
+          if (videoRef.current.videoWidth > 0) onResize();
           const playResult = videoRef.current.play();
           if (playResult && playResult.catch) {
             playResult.catch(() => undefined);
@@ -1225,6 +1308,10 @@ export function App() {
       } else if (message.type === 'screen-size' && message.payload) {
         const size = message.payload as { width: number; height: number };
         setScreenSize({ width: size.width, height: size.height });
+      } else if (message.type === 'capture-region' && message.payload) {
+        const region = message.payload as CaptureRegion;
+        console.debug('capture-region received', JSON.stringify(region));
+        setCaptureRegion(region);
       } else if (message.type === 'input-key-state' && message.payload) {
         setRemoteKeysPressed(message.payload as number[]);
       }
@@ -1332,6 +1419,10 @@ export function App() {
       wsRef.current = null;
       startedRef.current = false;
       if (videoRef.current) {
+        if (videoResizeHandlerRef.current) {
+          videoRef.current.removeEventListener('resize', videoResizeHandlerRef.current);
+          videoResizeHandlerRef.current = null;
+        }
         videoRef.current.srcObject = null;
       }
     };
@@ -1403,10 +1494,45 @@ export function App() {
       ) {
         setQualityOpen(false);
       }
+      if (
+        captureSettingsOpen &&
+        captureSettingsPopoverRef.current && captureSettingsButtonRef.current &&
+        !captureSettingsPopoverRef.current.contains(e.target as Node) &&
+        !captureSettingsButtonRef.current.contains(e.target as Node)
+      ) {
+        setCaptureSettingsOpen(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [statusOpen, inputMenuOpen, qualityOpen]);
+  }, [statusOpen, inputMenuOpen, qualityOpen, captureSettingsOpen]);
+
+  // Fetch sessions/displays/windows when capture settings popover opens.
+  useEffect(() => {
+    if (!captureSettingsOpen) return;
+    fetch('/api/sessions').then(r => r.json()).then(setSessions).catch(console.error);
+    fetch('/api/displays').then(r => r.json()).then(setDisplays).catch(console.error);
+    fetch('/api/windows').then(r => r.json()).then(data => {
+      setWindows(data);
+      // Auto-select first window if in window mode with no title.
+      if (captureMode === 'window' && !selectedWindowTitle && data && data.length > 0) {
+        setSelectedWindowTitle(data[0].title);
+      }
+    }).catch(console.error);
+  }, [captureSettingsOpen]);
+
+  const sendCaptureSettings = (
+    sid: number, mode: CaptureMode, displayIdx: number,
+    windowTitle: string, transpBg: WindowTransparencyBg,
+  ) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'capture-settings',
+        payload: { sessionId: sid, captureMode: mode, displayIndex: displayIdx, windowTitle, windowTransparencyBg: transpBg },
+      }));
+    }
+  };
 
   const reconnect = () => {
     if (document.pointerLockElement === videoRef.current) {
@@ -1415,6 +1541,7 @@ export function App() {
     setStatusOpen(false);
     setInputMenuOpen(false);
     setQualityOpen(false);
+    setCaptureSettingsOpen(false);
     setConnectionKey((k) => k + 1);
   };
 
@@ -1567,6 +1694,9 @@ export function App() {
         </button>
         <button ref={qualityButtonRef} className={`iconButtonWrap ${qualityOpen ? 'active' : ''}`} title="画质设置" onClick={() => setQualityOpen((o) => !o)}>
           <QualityIcon />
+        </button>
+        <button ref={captureSettingsButtonRef} className={`iconButtonWrap ${captureSettingsOpen ? 'active' : ''}`} title="采集设置" onClick={() => setCaptureSettingsOpen((o) => !o)}>
+          <CaptureSettingsIcon />
         </button>
       </section>
 
@@ -1746,6 +1876,110 @@ export function App() {
         </div>
       )}
 
+      {captureSettingsOpen && (
+        <div className="popover captureSettingsPopover" ref={captureSettingsPopoverRef}>
+          <h3>采集设置</h3>
+
+          {/* Session selector */}
+          <div className="selectRow">
+            <span className="selectLabel">会话</span>
+            <select className="cursorModeSelect" value={sessionId}
+              onChange={(e) => {
+                const id = Number(e.target.value);
+                setSessionId(id);
+                sendCaptureSettings(id, captureMode, selectedDisplayIndex, selectedWindowTitle, windowTransparencyBg);
+              }}>
+              {sessions.map(s => (
+                <option key={s.id} value={s.id}>{s.name} — {s.userName || '(无用户)'} ({s.state})</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Capture mode radio cards */}
+          <div className="captureModeCards">
+            {([
+              { value: 'desktop' as CaptureMode, title: '全部显示器', desc: '显示所有显示器组合画面' },
+              { value: 'display' as CaptureMode, title: '指定显示器', desc: '选择单个显示器进行采集' },
+              { value: 'window' as CaptureMode, title: '指定窗口', desc: '只采集指定窗口的画面' },
+            ]).map(opt => (
+              <label key={opt.value}
+                className={`presetOption ${captureMode === opt.value ? 'presetOption--selected' : ''}`}>
+                <input type="radio" name="captureMode" value={opt.value}
+                  checked={captureMode === opt.value}
+                  onChange={() => {
+                    setCaptureMode(opt.value);
+                    // Auto-select first window when switching to window mode with no title set.
+                    let winTitle = selectedWindowTitle;
+                    let transpBg = windowTransparencyBg;
+                    if (opt.value === 'window' && !winTitle && windows.length > 0) {
+                      winTitle = windows[0].title;
+                      setSelectedWindowTitle(winTitle);
+                    }
+                    sendCaptureSettings(sessionId, opt.value, selectedDisplayIndex, winTitle, transpBg);
+                  }} />
+                <span className="presetTitle">{opt.title}</span>
+                <span className="presetDesc">{opt.desc}</span>
+              </label>
+            ))}
+          </div>
+
+          {/* Display selector — only in display mode */}
+          {captureMode === 'display' && (
+            <div className="selectRow">
+              <span className="selectLabel">显示器</span>
+              <select className="cursorModeSelect" value={selectedDisplayIndex}
+                onChange={(e) => {
+                  const idx = Number(e.target.value);
+                  setSelectedDisplayIndex(idx);
+                  sendCaptureSettings(sessionId, captureMode, idx, selectedWindowTitle, windowTransparencyBg);
+                }}>
+                {displays.map(d => (
+                  <option key={d.index} value={d.index}>{d.name}{d.primary ? ' (主)' : ''} — {d.width}x{d.height}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Window selector + transparency — only in window mode */}
+          {captureMode === 'window' && (
+            <>
+              <div className="selectRow">
+                <span className="selectLabel">窗口</span>
+                <select className="cursorModeSelect" value={selectedWindowTitle}
+                  onChange={(e) => {
+                    const title = e.target.value;
+                    setSelectedWindowTitle(title);
+                    sendCaptureSettings(sessionId, captureMode, selectedDisplayIndex, title, windowTransparencyBg);
+                  }}>
+                  {windows.map(w => (
+                    <option key={w.title} value={w.title}>{w.title}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="selectRow">
+                <span className="selectLabel">透明背景</span>
+                <select className="cursorModeSelect" value={windowTransparencyBg}
+                  onChange={(e) => {
+                    const bg = e.target.value as WindowTransparencyBg;
+                    setWindowTransparencyBg(bg);
+                    sendCaptureSettings(sessionId, captureMode, selectedDisplayIndex, selectedWindowTitle, bg);
+                  }}>
+                  <option value="">保持透明（穿透）</option>
+                  <option value="black">纯黑</option>
+                  <option value="white">纯白</option>
+                </select>
+              </div>
+            </>
+          )}
+
+          <div className="inputHint">
+            {captureMode === 'desktop' ? '采集全部显示器组合画面，输入映射到完整桌面' :
+             captureMode === 'display' ? '只采集选中显示器，输入自动映射到正确位置' :
+             '采集指定窗口，透明区域可选纯色背景'}
+          </div>
+        </div>
+      )}
+
       <section className="viewer">
         <video
           ref={videoRef}
@@ -1760,7 +1994,7 @@ export function App() {
         )}
         {/* Remote cursor overlay: shown for remote mode, or when touchMode is trackpad/mouse */}
         {inputEnabled && (cursorMode === 'remote' || touchMode === 'trackpad' || touchMode === 'mouse') && (
-          <RemoteCursor videoRef={videoRef} cursorPos={cursorPos} screenSize={screenSize} cursorImage={cursorImage} />
+          <RemoteCursor videoRef={videoRef} cursorPos={cursorPos} screenSize={screenSize} cursorImage={cursorImage} captureRegion={captureRegion} />
         )}
         {/* Client cursor overlay: only when cursorMode=client AND not in trackpad/mouse touch mode */}
         {inputEnabled && cursorMode === 'client' && touchMode !== 'trackpad' && touchMode !== 'mouse' && (

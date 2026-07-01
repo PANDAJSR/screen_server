@@ -460,3 +460,23 @@ p {
   font-size: 12px;
   color: #8b95a5;
 }
+
+/* ---- Capture settings popover ---- */
+
+.captureSettingsPopover {
+  display: grid;
+  gap: 10px;
+  max-width: 360px; /* prevent overflow from long window titles */
+}
+
+.captureSettingsPopover .cursorModeSelect {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.captureModeCards {
+  display: grid;
+  gap: 6px;
+}

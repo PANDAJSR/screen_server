@@ -166,7 +166,7 @@ func (h *Hub) Run() {
 				})
 				continue
 			}
-			if h.handler != nil && (msg.Type == MessageTypeOffer || msg.Type == MessageTypeCandidate || msg.Type == MessageTypeInputMode || msg.Type == MessageTypeQualityPreset) {
+			if h.handler != nil && (msg.Type == MessageTypeOffer || msg.Type == MessageTypeCandidate || msg.Type == MessageTypeInputMode || msg.Type == MessageTypeQualityPreset || msg.Type == MessageTypeCaptureSettings) {
 				signal := ServerSignal{
 					ClientID: inbound.client.id,
 					Room:     inbound.client.room,

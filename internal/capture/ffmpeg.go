@@ -47,6 +47,33 @@ type FFmpegConfig struct {
 	// X264Preset overrides the libx264 speed preset. "ultrafast" is fastest,
 	// "veryslow" is best quality. Default "superfast" for low-latency encoding.
 	X264Preset string
+
+	// ---- Capture mode settings ----
+
+	// CaptureMode selects the capture target:
+	//   "desktop" (default) — full virtual desktop across all monitors
+	//   "display" — single monitor, positioned by DisplayOffsetX/Y
+	//   "window"  — single window identified by WindowTitle
+	CaptureMode string
+
+	// For "display" mode: monitor position and size on the virtual desktop.
+	DisplayOffsetX int
+	DisplayOffsetY int
+	DisplayWidth   int
+	DisplayHeight  int
+
+	// For "window" mode: target window title.
+	WindowTitle string
+
+	// WindowTransparencyBg replaces transparent/acrylic areas when capturing a
+	// window: "" (keep as-is / see-through), "black", or "white".
+	WindowTransparencyBg string
+}
+
+// Clone returns a shallow copy of the config. Value-types and strings are copied;
+// slices (if any) are not shared since this struct has none.
+func (c FFmpegConfig) Clone() FFmpegConfig {
+	return c
 }
 
 func DefaultFFmpegConfig() FFmpegConfig {
@@ -349,29 +376,50 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 	if profile == "" {
 		profile = "high"
 	}
-	// Input + output options shared by every encoder. Hardware encoders differ
-	// only in the codec/preset/RC block; bitrate, GOP, no B-frames, profile
-	// and AUD insertion stay identical so quality and the Annex-B frame
-	// framing are unchanged versus the software path.
+
+	// Window mode with transparency background: uses two inputs (window + color)
+	// and filter_complex instead of -vf, so it needs a dedicated builder.
+	if cfg.CaptureMode == "window" && cfg.WindowTitle != "" && cfg.WindowTransparencyBg != "" {
+		return buildWindowsWindowTransparentArgs(cfg, drawMouse, profile)
+	}
+
+	// ---- Common input preamble ----
 	common := []string{
 		"-hide_banner",
-		"-loglevel", "info", // info exposes speed= lines for latency diagnosis
+		"-loglevel", "info",
 		"-fflags", "nobuffer",
-		"-thread_queue_size", "512", // give gdigrab capture thread headroom
+		"-thread_queue_size", "512",
 		"-f", "gdigrab",
 		"-framerate", fmt.Sprintf("%d", cfg.FPS),
 		"-draw_mouse", drawMouse,
 	}
-	// Allow overriding gdigrab capture area via env for displays where auto-
-	// detection introduces latency (e.g. SCREEN_SERVER_CAPTURE_SIZE=1920x1200).
-	if size := os.Getenv("SCREEN_SERVER_CAPTURE_SIZE"); size != "" {
-		common = append(common, "-video_size", size)
+
+	// Input target: desktop, desktop sub-region, or window.
+	switch cfg.CaptureMode {
+	case "display":
+		// Capture a single monitor by its virtual-desktop offset and size.
+		if cfg.DisplayWidth > 0 && cfg.DisplayHeight > 0 {
+			common = append(common,
+				"-offset_x", fmt.Sprintf("%d", cfg.DisplayOffsetX),
+				"-offset_y", fmt.Sprintf("%d", cfg.DisplayOffsetY),
+				"-video_size", fmt.Sprintf("%dx%d", cfg.DisplayWidth, cfg.DisplayHeight),
+			)
+		}
+		common = append(common, "-i", "desktop")
+	case "window":
+		// Capture a specific window by title.
+		common = append(common, "-i", fmt.Sprintf("title=%s", cfg.WindowTitle))
+	default: // "desktop" / ""
+		// Full virtual desktop (existing behavior).
+		if size := os.Getenv("SCREEN_SERVER_CAPTURE_SIZE"); size != "" {
+			common = append(common, "-video_size", size)
+		}
+		common = append(common, "-i", "desktop")
 	}
-	common = append(common,
-		"-i", "desktop",
-		"-an",
-		"-avioflags", "direct",
-	)
+
+	common = append(common, "-an", "-avioflags", "direct")
+
+	// ---- Tail (bitrate, GOP, profile, output) ----
 	tail := []string{
 		"-b:v", cfg.Bitrate,
 		"-maxrate", cfg.MaxRate,
@@ -384,15 +432,77 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 		"pipe:1",
 	}
 
-	var enc []string
+	enc := buildEncoderArgs(cfg)
+
+	return append(append(common, enc...), tail...)
+}
+
+// buildWindowsWindowTransparentArgs builds args for window capture with a solid
+// background behind transparent/acrylic areas.
+func buildWindowsWindowTransparentArgs(cfg FFmpegConfig, drawMouse, profile string) []string {
+	bgColor := "black"
+	if cfg.WindowTransparencyBg == "white" {
+		bgColor = "white"
+	}
+	fps := fmt.Sprintf("%d", cfg.FPS)
+
+	// Two inputs: [0] gdigrab window capture, [1] lavfi solid color.
+	// filter_complex overlays window onto solid background.
+	common := []string{
+		"-hide_banner",
+		"-loglevel", "info",
+		"-fflags", "nobuffer",
+		"-thread_queue_size", "512",
+		"-f", "gdigrab",
+		"-framerate", fps,
+		"-draw_mouse", drawMouse,
+		"-i", fmt.Sprintf("title=%s", cfg.WindowTitle),
+		"-f", "lavfi",
+		"-i", fmt.Sprintf("color=c=%s:s=1920x1080:r=%s", bgColor, fps),
+		"-an",
+		"-avioflags", "direct",
+	}
+
+	tail := []string{
+		"-b:v", cfg.Bitrate,
+		"-maxrate", cfg.MaxRate,
+		"-bufsize", cfg.BufferSize,
+		"-g", fmt.Sprintf("%d", cfg.GOP),
+		"-bf", "0",
+		"-profile:v", profile,
+		"-bsf:v", "h264_metadata=aud=insert",
+		"-f", "h264",
+		"pipe:1",
+	}
+
+	// Encoder args: use filter_complex instead of -vf. The filter_complex
+	// overlays the window onto the color background, then passes through the
+	// format conversion before encoding.
+	enc := buildEncoderFilterComplex(cfg)
+
+	// With filter_complex we use filter_complex output label for the encoder.
+	// buildEncoderFilterComplex returns the filter_complex and codec args;
+	// the filter_complex output pad is "[out]" which maps implicitly.
+	result := append(common, enc...)
+	result = append(result, tail...)
+	return result
+}
+
+// buildEncoderFilterComplex returns filter_complex + encoder args for window
+// mode with transparency background. The gdigrab window input is [0:v] and the
+// color background input is [1:v].
+func buildEncoderFilterComplex(cfg FFmpegConfig) []string {
+	// Normalize to bgra first so gdigrab format switches (bgr0↔bgra, common
+	// with console windows) don't break the downstream hardware filters.
+	filter := "[1:v][0:v]overlay=0:0,format=bgra"
 	switch cfg.Encoder {
 	case "nvenc":
 		nvencPreset := cfg.NvencPreset
 		if nvencPreset == "" {
 			nvencPreset = "p2"
 		}
-		enc = []string{
-			"-vf", "format=nv12,hwupload_cuda",
+		return []string{
+			"-filter_complex", filter + ",format=nv12,hwupload_cuda",
 			"-c:v", "h264_nvenc",
 			"-preset", nvencPreset,
 			"-tune", "ll",
@@ -401,8 +511,8 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 			"-spatial_aq", "1",
 		}
 	case "qsv":
-		enc = []string{
-			"-vf", "format=nv12,hwupload=extra_hw_frames=16",
+		return []string{
+			"-filter_complex", filter + ",format=nv12,hwupload=extra_hw_frames=16",
 			"-c:v", "h264_qsv",
 			"-preset", "veryfast",
 			"-look_ahead", "0",
@@ -410,30 +520,77 @@ func buildWindowsArgs(cfg FFmpegConfig) []string {
 			"-adaptive_b", "1",
 		}
 	case "amf":
-		// lowlatency + balanced quality is a big step up from ultralowlatency
-		// while still keeping encode latency near zero on AMF ASIC.
-		enc = []string{
-			"-vf", "format=nv12",
+		return []string{
+			"-filter_complex", filter + ",format=nv12",
 			"-c:v", "h264_amf",
 			"-usage", "lowlatency",
 			"-quality", "balanced",
 			"-rc", "cbr",
 		}
-	default: // "x264" / "" — software fallback
+	default: // x264
 		x264Preset := cfg.X264Preset
 		if x264Preset == "" {
 			x264Preset = "superfast"
 		}
-		enc = []string{
-			"-vf", "format=yuv420p",
+		return []string{
+			"-filter_complex", filter + ",format=yuv420p",
 			"-c:v", "libx264",
 			"-threads", "2",
 			"-preset", x264Preset,
 			"-tune", "zerolatency",
 		}
 	}
+}
 
-	return append(append(common, enc...), tail...)
+// buildEncoderArgs returns encoder-specific args (using -vf for simple filter).
+// Prepends format=bgra to normalize gdigrab output, which can switch between
+// bgr0 and bgra depending on window content (e.g. console windows).
+func buildEncoderArgs(cfg FFmpegConfig) []string {
+	switch cfg.Encoder {
+	case "nvenc":
+		nvencPreset := cfg.NvencPreset
+		if nvencPreset == "" {
+			nvencPreset = "p2"
+		}
+		return []string{
+			"-vf", "format=bgra,format=nv12,hwupload_cuda",
+			"-c:v", "h264_nvenc",
+			"-preset", nvencPreset,
+			"-tune", "ll",
+			"-rc", "cbr",
+			"-delay", "0",
+			"-spatial_aq", "1",
+		}
+	case "qsv":
+		return []string{
+			"-vf", "format=bgra,format=nv12,hwupload=extra_hw_frames=16",
+			"-c:v", "h264_qsv",
+			"-preset", "veryfast",
+			"-look_ahead", "0",
+			"-adaptive_i", "1",
+			"-adaptive_b", "1",
+		}
+	case "amf":
+		return []string{
+			"-vf", "format=bgra,format=nv12",
+			"-c:v", "h264_amf",
+			"-usage", "lowlatency",
+			"-quality", "balanced",
+			"-rc", "cbr",
+		}
+	default: // "x264" / ""
+		x264Preset := cfg.X264Preset
+		if x264Preset == "" {
+			x264Preset = "superfast"
+		}
+		return []string{
+			"-vf", "format=bgra,format=yuv420p",
+			"-c:v", "libx264",
+			"-threads", "2",
+			"-preset", x264Preset,
+			"-tune", "zerolatency",
+		}
+	}
 }
 
 // x264Preset returns the configured x264 preset, defaulting to "superfast".

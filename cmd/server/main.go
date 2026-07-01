@@ -13,6 +13,7 @@ import (
 
 	"screen_server/internal/rtc"
 	"screen_server/internal/signaling"
+	"screen_server/internal/sysinfo"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -76,6 +77,9 @@ func main() {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/api/signaling/ws", hub.ServeWS)
+	mux.HandleFunc("/api/sessions", sysinfo.HandleSessions)
+	mux.HandleFunc("/api/displays", sysinfo.HandleDisplays)
+	mux.HandleFunc("/api/windows", sysinfo.HandleWindows)
 
 	// In development the React app is usually served by Vite on :5173.
 	// For production, run `npm run build` in frontend/ and this serves dist/.

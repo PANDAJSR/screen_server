@@ -26,6 +26,8 @@ export type SignalType =
   | 'latency-start'
   | 'latency-blue'
   | 'latency-red'
+  | 'capture-settings'
+  | 'capture-region'
   | 'log';
 
 export interface SignalMessage<TPayload = unknown> {

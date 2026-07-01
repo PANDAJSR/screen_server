@@ -20,6 +20,12 @@ const (
 	// Quality preset message — client selects a quality/latency trade-off.
 	MessageTypeQualityPreset = "quality-preset"
 
+	// Capture settings — client selects capture mode (desktop/display/window).
+	MessageTypeCaptureSettings = "capture-settings"
+
+	// Capture region — server sends the active capture area for input mapping.
+	MessageTypeCaptureRegion = "capture-region"
+
 	// Input control message types
 	MessageTypeInputMode          = "input-mode"           // enable/disable control mode
 	MessageTypeInputKeyDown       = "input-keydown"        // key press

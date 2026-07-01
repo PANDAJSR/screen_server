@@ -14,6 +14,7 @@ import (
 
 	"screen_server/internal/capture"
 	"screen_server/internal/signaling"
+	"screen_server/internal/sysinfo"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
@@ -172,6 +173,8 @@ func (m *Manager) OnSignal(ctx context.Context, signal signaling.ServerSignal) {
 		m.handleInputMode(signal)
 	case signaling.MessageTypeQualityPreset:
 		m.handleQualityPreset(signal)
+	case signaling.MessageTypeCaptureSettings:
+		m.handleCaptureSettings(signal)
 	}
 }
 
@@ -271,6 +274,179 @@ func (m *Manager) handleQualityPreset(signal signaling.ServerSignal) {
 	}
 }
 
+func (m *Manager) handleCaptureSettings(signal signaling.ServerSignal) {
+	var payload struct {
+		SessionID            int    `json:"sessionId"`
+		CaptureMode          string `json:"captureMode"`
+		DisplayIndex         int    `json:"displayIndex"`
+		WindowTitle          string `json:"windowTitle"`
+		WindowTransparencyBg string `json:"windowTransparencyBg"`
+	}
+	if err := json.Unmarshal(signal.Message.Payload, &payload); err != nil {
+		log.Printf("capture-settings parse error client=%s err=%v", signal.ClientID, err)
+		return
+	}
+
+	m.mu.Lock()
+	session := m.sessions[signal.ClientID]
+	m.mu.Unlock()
+	if session == nil {
+		return
+	}
+
+	cfg := m.captureCfg.Clone()
+	cfg.CaptureMode = payload.CaptureMode
+	cfg.WindowTitle = payload.WindowTitle
+	cfg.WindowTransparencyBg = payload.WindowTransparencyBg
+
+	// Reject window mode with empty title — ffmpeg would fail and freeze.
+	if payload.CaptureMode == "window" && payload.WindowTitle == "" {
+		log.Printf("capture-settings client=%s mode=window rejected: empty window title", signal.ClientID)
+		return
+	}
+
+	// Resolve display offset/size for display mode.
+	if payload.CaptureMode == "display" {
+		displays, err := sysinfo.EnumDisplays()
+		if err == nil && payload.DisplayIndex >= 0 && payload.DisplayIndex < len(displays) {
+			d := displays[payload.DisplayIndex]
+			cfg.DisplayOffsetX = d.X
+			cfg.DisplayOffsetY = d.Y
+			cfg.DisplayWidth = d.Width
+			cfg.DisplayHeight = d.Height
+		}
+	}
+
+	log.Printf("capture-settings client=%s mode=%s displayIdx=%d window=%q transp=%q offset=%d,%d size=%dx%d",
+		signal.ClientID, cfg.CaptureMode, payload.DisplayIndex, cfg.WindowTitle,
+		cfg.WindowTransparencyBg, cfg.DisplayOffsetX, cfg.DisplayOffsetY,
+		cfg.DisplayWidth, cfg.DisplayHeight)
+
+	// Send capture-region to the client for input coordinate mapping.
+	m.sendCaptureRegion(session, cfg)
+
+	// Manage window-position polling so input mapping stays correct when the
+	// user drags the captured window.
+	if cfg.CaptureMode == "window" && cfg.WindowTitle != "" {
+		m.startWindowPoll(session, cfg.WindowTitle)
+	} else {
+		m.stopWindowPoll(session)
+	}
+
+	// Drain any pending restart config, then send the new one.
+	// Use non-blocking send so a dead capture pipe (readFrames exited due to
+	// ffmpeg error) doesn't hang the handler goroutine.
+	select {
+	case <-session.restartCh:
+	default:
+	}
+	select {
+	case session.restartCh <- cfg:
+	default:
+		log.Printf("capture restart failed client=%s: channel full or capture dead", signal.ClientID)
+	}
+}
+
+// sendCaptureRegion sends the current capture region (offset + size) to the
+// client so it can map input coordinates from video space to screen space.
+func (m *Manager) sendCaptureRegion(session *Session, cfg capture.FFmpegConfig) {
+	var offsetX, offsetY, width, height int
+
+	switch cfg.CaptureMode {
+	case "display":
+		offsetX = cfg.DisplayOffsetX
+		offsetY = cfg.DisplayOffsetY
+		width = cfg.DisplayWidth
+		height = cfg.DisplayHeight
+	case "window":
+		if cfg.WindowTitle != "" {
+			x, y, w, h, found := sysinfo.GetWindowRectByTitle(cfg.WindowTitle)
+			if found {
+				offsetX = x
+				offsetY = y
+				width = w
+				height = h
+			}
+		}
+		if width == 0 {
+			vw, vh := sysinfo.GetVirtualScreenSize()
+			width = vw
+			height = vh
+		}
+	default: // "desktop"
+		vw, vh := sysinfo.GetVirtualScreenSize()
+		ox, oy := sysinfo.GetVirtualScreenOrigin()
+		offsetX = ox
+		offsetY = oy
+		width = vw
+		height = vh
+	}
+
+	vOriginX, vOriginY := sysinfo.GetVirtualScreenOrigin()
+	log.Printf("capture-region client=%s mode=%s region=(%d,%d %dx%d) virtualOrigin=(%d,%d)",
+		session.clientID, cfg.CaptureMode, offsetX, offsetY, width, height, vOriginX, vOriginY)
+
+	session.send(signaling.Message{
+		Type: signaling.MessageTypeCaptureRegion,
+		Payload: mustJSON(map[string]int{
+			"offsetX": offsetX,
+			"offsetY": offsetY,
+			"width":   width,
+			"height":  height,
+		}),
+	})
+}
+
+// startWindowPoll starts a background goroutine that re-sends capture-region
+// when the captured window moves.
+func (m *Manager) startWindowPoll(session *Session, windowTitle string) {
+	m.stopWindowPoll(session)
+
+	pollCtx, cancel := context.WithCancel(session.ctx)
+	session.windowPollCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		defer log.Printf("window-poll stopped client=%s", session.clientID)
+
+		lastX, lastY, lastW, lastH := -1, -1, -1, -1
+		for {
+			select {
+			case <-pollCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			x, y, w, h, found := sysinfo.GetWindowRectByTitle(windowTitle)
+			if !found {
+				continue
+			}
+			if x != lastX || y != lastY || w != lastW || h != lastH {
+				log.Printf("window-poll client=%s window=%q moved: (%d,%d %dx%d) -> (%d,%d %dx%d)",
+					session.clientID, windowTitle, lastX, lastY, lastW, lastH, x, y, w, h)
+				lastX, lastY, lastW, lastH = x, y, w, h
+				session.send(signaling.Message{
+					Type: signaling.MessageTypeCaptureRegion,
+					Payload: mustJSON(map[string]int{
+						"offsetX": x,
+						"offsetY": y,
+						"width":   w,
+						"height":  h,
+					}),
+				})
+			}
+		}
+	}()
+}
+
+// stopWindowPoll stops the window-position polling goroutine if active.
+func (m *Manager) stopWindowPoll(session *Session) {
+	if session.windowPollCancel != nil {
+		session.windowPollCancel()
+		session.windowPollCancel = nil
+	}
+}
+
 func (m *Manager) OnDisconnect(clientID string) {
 	m.mu.Lock()
 	session := m.sessions[clientID]
@@ -342,6 +518,10 @@ func (m *Manager) handleOffer(ctx context.Context, signal signaling.ServerSignal
 		session.Close()
 		return err
 	}
+
+	// Send initial capture-region so the client knows the coordinate mapping.
+	m.sendCaptureRegion(session, m.captureCfg)
+
 	return nil
 }
 
@@ -380,6 +560,10 @@ type Session struct {
 	once      sync.Once
 	done      chan struct{}
 	restartCh chan capture.FFmpegConfig
+
+	// windowPollCancel cancels the window-position polling goroutine used when
+	// capture mode is "window". nil when not polling.
+	windowPollCancel context.CancelFunc
 
 	// Per-second timing accumulators (writeFrames goroutine only; single-writer,
 	// no lock needed).
@@ -483,6 +667,13 @@ func (s *Session) readFrames(cfg capture.FFmpegConfig, stream *capture.FFmpegCap
 	defer func() {
 		if err := stream.Stop(); err != nil {
 			log.Printf("stop capture failed client=%s err=%v", s.clientID, err)
+		}
+		// If we're exiting because of a capture error (not because Close() was
+		// called), mark the session as dead so the Manager doesn't try to send
+		// restart configs into a channel with no consumer.
+		if s.ctx.Err() == nil {
+			log.Printf("capture pipe died unexpectedly for client=%s, closing session", s.clientID)
+			s.Close()
 		}
 	}()
 
